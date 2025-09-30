@@ -15,13 +15,12 @@
 # limitations under the License.
 #
 
-# patch_utils should be the first import, because it will be used by other
-# patch files.
-import vllm_ascend.patch.worker.patch_common.patch_utils  # noqa isort:skip
-import vllm_ascend.patch.worker.patch_common.patch_distributed  # noqa
-import vllm_ascend.patch.worker.patch_common.patch_minicpm  # noqa
-import vllm_ascend.patch.worker.patch_common.patch_multi_step_worker  # noqa
-import vllm_ascend.patch.worker.patch_common.patch_sampler  # noqa
-import vllm_ascend.patch.worker.patch_common.patch_spec_decode_worker  # noqa
-import vllm_ascend.patch.worker.patch_common.patch_config  # noqa
-import vllm_ascend.patch.worker.patch_common.patch_parsers  # noqa
+
+from vllm.entrypoints.openai import tool_parsers
+from vllm_ascend.entrypoints.openai.tool_parsers import PanguToolParser
+tool_parsers.__all__.append("PanguToolParser")
+
+
+from vllm import reasoning
+from vllm_ascend.entrypoints.openai.reasoning_parsers import PanguReasoningParser
+reasoning.__all__.append("PanguReasoningParser")

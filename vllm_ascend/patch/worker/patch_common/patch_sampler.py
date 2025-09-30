@@ -21,7 +21,8 @@ from typing import Optional
 import torch
 import torch_npu
 from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler, random_sample
-
+from vllm.v1.sample.sampler import Sampler, _SAMPLING_EPS
+from vllm.v1.sample.metadata import SamplingMetadata
 from vllm_ascend import envs
 
 
@@ -79,5 +80,80 @@ def topk_topp_forward_native(
     return random_sample(probs, generators)
 
 
+def apply_top_n_sigma(
+    logits: torch.Tensor,
+    sampling_metadata: SamplingMetadata,
+):
+    if sampling_metadata.no_top_n_sigma:
+        return logits
+
+    top_n_sigma = sampling_metadata.top_n_sigma[:, None]
+    top_n_sigma_mask = (top_n_sigma != -1)
+    filter_value = -3.4028e+38
+    max_vals, _ = logits.max(dim=-1, keepdim=True)
+    std_vals = logits.std(dim=-1, keepdim=True)
+    threshold = max_vals - top_n_sigma * std_vals
+    threshold[~top_n_sigma_mask] = filter_value
+    mask = (logits < threshold)
+    logits = torch.where(mask, filter_value, logits)
+    return logits
+
+
+def sample(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+) -> torch.Tensor:
+    """Sample logits based on sampling metadata.
+
+    The various logits processing functions called in this method
+    may update the logits tensor in-place.
+    """
+
+    assert not (sampling_metadata.all_greedy
+                and sampling_metadata.all_random)
+    if sampling_metadata.all_random:
+        greedy_sampled = None
+    else:
+        greedy_sampled = self.greedy_sample(logits)
+        if sampling_metadata.all_greedy:
+            return greedy_sampled
+
+    assert sampling_metadata.temperature is not None
+
+    # Apply temperature.
+    logits = self.apply_temperature(logits, sampling_metadata.temperature)
+
+    # Apply logits processors that only apply to random sampling
+    # (argmax invariant)
+    for processor in sampling_metadata.logitsprocs.argmax_invariant:
+        logits = processor.apply(logits)
+
+    # Apply top_n_sigma
+    logits = apply_top_n_sigma(logits, sampling_metadata)
+
+    # Apply top_k and/or top_p.
+    random_sampled = self.topk_topp_sampler(
+        logits,
+        sampling_metadata.generators,
+        sampling_metadata.top_k,
+        sampling_metadata.top_p,
+    )
+
+    if greedy_sampled is None:
+        return random_sampled
+
+    sampled = torch.where(
+        sampling_metadata.temperature < _SAMPLING_EPS,
+        greedy_sampled,
+        random_sampled,
+        out=greedy_sampled,  # Reuse tensor
+    )
+    return sampled
+
+
 if envs.VLLM_ASCEND_ENABLE_TOPK_TOPP_OPTIMIZATION:
     TopKTopPSampler.forward_native = topk_topp_forward_native
+
+if envs.VLLM_ASCEND_ENABLE_TOP_N_SIGMA:
+    Sampler.sample = sample

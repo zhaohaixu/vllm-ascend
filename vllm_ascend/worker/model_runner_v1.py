@@ -87,6 +87,7 @@ from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_ND, ACL_FORMAT_FRACTAL_NZ,
 from vllm_ascend.worker.eagle_proposer_v1 import EagleProposer
 from vllm_ascend.worker.mtp_proposer_v1 import MtpProposer
 from vllm_ascend.worker.npu_input_batch import CachedRequestState, InputBatch
+from vllm_ascend.patch.worker.patch_common.patch_config import get_attr_by_names
 
 if TYPE_CHECKING:
     import xgrammar as xgr  # type: ignore[import-untyped]
@@ -1874,6 +1875,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 "NPU.")
             kv_cache_sizes[kv_cache_tensor.shared_by[0]] = kv_cache_tensor.size
 
+        kv_lora_dim_names = ['attention_kv_lora_dim', 'kv_lora_rank']
+        qk_rope_dim_names = ['attention_qk_rope_dim', 'qk_rope_head_dim']
+        kv_lora_dim = get_attr_by_names(self.model_config.hf_text_config, kv_lora_dim_names, 0)
+        qk_rope_dim = get_attr_by_names(self.model_config.hf_text_config, qk_rope_dim_names, 0)
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             kv_cache_spec = kv_cache_group.kv_cache_spec
             for layer_name in kv_cache_group.layer_names:
@@ -1927,16 +1932,12 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         else:
                             # for MLA attention backend that use torchair.
                             layer_kv_cache_nope = torch.zeros(
-                                kv_cache_shape[:-1] +
-                                (self.model_config.hf_text_config.kv_lora_rank,
-                                 ),
+                                kv_cache_shape[:-1] + (kv_lora_dim, ),
                                 dtype=self.dtype,
                                 pin_memory=True,
                                 device=self.device)
                             layer_kv_cache_pe = torch.zeros(
-                                kv_cache_shape[:-1] +
-                                (self.model_config.hf_text_config.
-                                 qk_rope_head_dim, ),
+                                kv_cache_shape[:-1] + (qk_rope_dim, ),
                                 dtype=self.dtype,
                                 pin_memory=True,
                                 device=self.device)

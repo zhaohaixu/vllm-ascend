@@ -569,15 +569,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         if speculative_config is not None:
             self.spec_token_num = speculative_config.num_speculative_tokens
             assert self.spec_token_num > 0
-
-        # TODO: support numHeads / numKvHeads < 16 in MLA kernel
-        if self.torchair_graph_enabled:
-            assert self.num_queries_per_kv in _ALLOWED_NUM_QUERIES_PER_KV, \
-                ("The allowed number of queries per kv when enabling both MLA and Graph mode"
-                " only support {32, 64, 128}, Thus this is not supported for DeepSeek-V2-Lite,"
-                " as it only has 16 attention heads. And if you're using DeepSeek-V3 or DeepSeek-R1,"
-                " please make sure after the tensor parallel split, num_heads / num_kv_heads in "
-                "{32, 64, 128}.")
+        self.SHARE_MASK_TRIL_SPARSE = ~torch.tril(torch.ones((2048, 2048), dtype=torch.bool)).npu()
 
     def _v_up_proj_and_o_proj(self, x, enable_multistream_mla: bool = False):
         # Convert from (B, N, L) to (N, B, L)
@@ -829,16 +821,19 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         elif attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
             key = torch.cat((k_nope, k_pe), dim=-1)
-            torch_npu._npu_flash_attention(
-                query=query,
-                key=key,
-                value=value,
-                mask=attn_metadata.attn_mask,
-                seq_len=attn_metadata.prefill.context_lens,
-                scale_value=self.scale,
+            context_lens_list = torch.cumsum(attn_metadata.prefill.context_lens, dim=0).tolist()
+            attn_output = torch_npu.npu_fused_infer_attention_score(
+                query,
+                key,
+                value,
                 num_heads=self.num_heads,
-                num_kv_heads=self.num_heads,
-                out=attn_output)
+                input_layout="TND",
+                scale=self.scale,
+                sparse_mode=3,
+                atten_mask=self.SHARE_MASK_TRIL_SPARSE,
+                actual_seq_lengths=context_lens_list,
+                actual_seq_lengths_kv=context_lens_list,
+                inner_precise=0)[0]
             attn_output = attn_output.view(-1, self.num_heads, self.v_head_dim)
         else:
             raise RuntimeError(
@@ -1086,7 +1081,8 @@ class AscendMLAImpl(MLAAttentionImpl):
             decode_k_nope = None
             assert attn_metadata.decode is not None
             if self.running_in_graph:
-                seq_len = self.rotary_emb.max_position_embeddings * self.rotary_emb.scaling_factor
+                seq_len = self.rotary_emb.max_position_embeddings * \
+                    getattr(self.rotary_emb, "scaling_factor", 1)
                 cos = self.rotary_emb.cos_cached[:seq_len].to(
                     dtype=decode_hs_or_q_c.dtype)
                 sin = self.rotary_emb.sin_cached[:seq_len].to(
@@ -1141,7 +1137,8 @@ class AscendMLAImpl(MLAAttentionImpl):
             prefill_q_nope = prefill_q[..., :self.qk_nope_head_dim]
             if self.torchair_graph_enabled:
                 num_tokens = prefill_hs_or_q_c.shape[0]
-                seq_len = self.rotary_emb.max_position_embeddings * self.rotary_emb.scaling_factor
+                seq_len = self.rotary_emb.max_position_embeddings * \
+                    getattr(self.rotary_emb, "scaling_factor", 1)
                 cos = self.rotary_emb.cos_cached[:seq_len].to(
                     dtype=prefill_q_pe.dtype)
                 sin = self.rotary_emb.sin_cached[:seq_len].to(

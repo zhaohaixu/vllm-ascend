@@ -18,7 +18,7 @@
 #
 
 from dataclasses import dataclass
-from typing import Optional, cast
+from typing import Optional, cast, Union
 
 import numpy as np
 import torch
@@ -72,6 +72,10 @@ class CachedRequestState:
         else:
             return self.output_token_ids[idx - self.num_prompt_tokens]
 
+@dataclass
+class SamplingMetadataTopNSigma(SamplingMetadata):
+    top_n_sigma: torch.Tensor
+    no_top_n_sigma: bool
 
 class InputBatch:
 
@@ -177,6 +181,19 @@ class InputBatch:
                                             pin_memory=pin_memory)
         self.min_p_cpu = self.min_p_cpu_tensor.numpy()
         self.min_p_reqs: set[str] = set()
+
+        # topnsigma penalty
+        self.top_n_sigma = torch.empty((max_num_reqs, ),
+                                               dtype=torch.float,
+                                               device=device)
+        self.top_n_sigma_cpu_tensor = torch.empty(
+            (max_num_reqs, ),
+            dtype=torch.float,
+            device="cpu",
+            pin_memory=pin_memory)
+        self.top_n_sigma_cpu = \
+            self.top_n_sigma_cpu_tensor.numpy()
+        self.top_n_sigma_reqs: set[str] = set()
 
         # Frequency penalty related data structures
         self.frequency_penalties = torch.empty((max_num_reqs, ),
@@ -347,6 +364,13 @@ class InputBatch:
                 self.min_tokens[req_index] = (
                     sampling_params.min_tokens,
                     sampling_params.all_stop_token_ids)
+            
+            if sampling_params.extra_args and "top_n_sigma" in sampling_params.extra_args:
+                self.top_n_sigma_cpu[
+                    req_index] = sampling_params.extra_args["top_n_sigma"]
+                self.top_n_sigma_reqs.add(req_id)
+            else:
+                self.top_n_sigma_cpu[req_index] = -1
 
             # NOTE(woosuk): self.generators should not include the requests that
             # do not have their own generator.
@@ -420,6 +444,7 @@ class InputBatch:
         self.presence_penalties_reqs.discard(req_id)
         self.repetition_penalties_reqs.discard(req_id)
         self.spec_decode_unsupported_reqs.discard(req_id)
+        self.top_n_sigma_reqs.discard(req_id)
         self.generators.pop(req_index, None)
         self.num_logprobs.pop(req_id, None)
         self.num_prompt_logprobs.pop(req_id, None)
@@ -475,6 +500,8 @@ class InputBatch:
             self.repetition_penalties_cpu[i2], self.repetition_penalties_cpu[i1]
         self.min_p_cpu[i1], self.min_p_cpu[i2] =\
             self.min_p_cpu[i2], self.min_p_cpu[i1]
+        self.top_n_sigma_cpu[i1], self.top_n_sigma_cpu[i2] =\
+            self.top_n_sigma_cpu[i2], self.top_n_sigma_cpu[i1]
 
         # NOTE: the following is unsafe
         # self.token_ids_cpu[i1, ...], self.token_ids_cpu[i2, ...], =\
@@ -559,6 +586,8 @@ class InputBatch:
             self.repetition_penalties_cpu[
                 empty_index] = self.repetition_penalties_cpu[last_req_index]
             self.min_p_cpu[empty_index] = self.min_p_cpu[last_req_index]
+            self.top_n_sigma_cpu[
+                empty_index] = self.top_n_sigma_cpu[last_req_index]
             generator = self.generators.pop(last_req_index, None)
             if generator is not None:
                 self.generators[empty_index] = generator
@@ -591,7 +620,7 @@ class InputBatch:
     def refresh_sampling_metadata(self):
         self.sampling_metadata = self._make_sampling_metadata()
 
-    def _make_sampling_metadata(self) -> SamplingMetadata:
+    def _make_sampling_metadata(self) -> Union[SamplingMetadata, SamplingMetadataTopNSigma]:
         num_reqs = self.num_reqs
         if not self.all_greedy:
             temperature = copy_slice(self.temperature_cpu_tensor,
@@ -615,6 +644,11 @@ class InputBatch:
                        self.presence_penalties, num_reqs)
             copy_slice(self.repetition_penalties_cpu_tensor,
                        self.repetition_penalties, num_reqs)
+        
+        if not self.no_top_n_sigma:
+            copy_slice(self.top_n_sigma_cpu_tensor,
+                       self.top_n_sigma, num_reqs)
+
 
         needs_prompt_token_ids = (not self.no_penalties or
                                   (self.num_reqs > 0
@@ -635,7 +669,7 @@ class InputBatch:
                        self.allowed_token_ids_mask, num_reqs)
             allowed_token_ids_mask = self.allowed_token_ids_mask[:num_reqs]
 
-        return SamplingMetadata(
+        return SamplingMetadataTopNSigma(
             temperature=temperature,
             all_greedy=self.all_greedy,
             all_random=self.all_random,
@@ -647,8 +681,10 @@ class InputBatch:
             frequency_penalties=self.frequency_penalties[:num_reqs],
             presence_penalties=self.presence_penalties[:num_reqs],
             repetition_penalties=self.repetition_penalties[:num_reqs],
+            top_n_sigma=self.top_n_sigma[:num_reqs],
             output_token_ids=cast(list[list[int]], self.req_output_token_ids),
             no_penalties=self.no_penalties,
+            no_top_n_sigma=self.no_top_n_sigma,
             allowed_token_ids_mask=allowed_token_ids_mask,
             bad_words_token_ids=self.bad_words_token_ids,
             logitsprocs=self.logitsprocs,
@@ -743,6 +779,9 @@ class InputBatch:
         return (len(self.presence_penalties_reqs) == 0
                 and len(self.frequency_penalties_reqs) == 0
                 and len(self.repetition_penalties_reqs) == 0)
+    @property 
+    def no_top_n_sigma(self) -> bool:
+        return len(self.top_n_sigma_reqs) == 0
 
     @property
     def max_num_logprobs(self) -> Optional[int]:

@@ -8,6 +8,8 @@ def register_model():
     from .deepseek_mtp import CustomDeepSeekMTP  # noqa: F401
     from .deepseek_v2 import CustomDeepseekV2ForCausalLM  # noqa: F401
     from .deepseek_v2 import CustomDeepseekV3ForCausalLM  # noqa: F401
+    from .open_pangu import PanguUltraMoEForCausalLM  # noqa: F401
+    from .open_pangu import PanguEmbeddedForCausalLM  # noqa: F401
     from .qwen2_5_vl import \
         AscendQwen2_5_VLForConditionalGeneration  # noqa: F401
     from .qwen2_vl import AscendQwen2VLForConditionalGeneration  # noqa: F401
@@ -56,3 +58,11 @@ def register_model():
     ModelRegistry.register_model(
         "PanguProMoEForCausalLM",
         "vllm_ascend.models.pangu_moe:PanguProMoEForCausalLM")
+    
+    ModelRegistry.register_model(
+        "PanguUltraMoEForCausalLM",
+        "vllm_ascend.models.open_pangu:PanguUltraMoEForCausalLM")
+
+    ModelRegistry.register_model(
+        "PanguEmbeddedForCausalLM",
+        "vllm_ascend.models.open_pangu:PanguEmbeddedForCausalLM")

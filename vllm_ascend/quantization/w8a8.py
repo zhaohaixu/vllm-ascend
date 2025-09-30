@@ -711,7 +711,6 @@ def select_experts(
                                                 sorted=False)
     elif custom_routing_function is None:
         topk_weights, topk_ids = topk_weights.topk(top_k, dim=-1)
-        topk_weights = topk_weights.to(hidden_states.dtype)
     else:
         topk_weights, topk_ids = custom_routing_function(
             hidden_states=hidden_states,

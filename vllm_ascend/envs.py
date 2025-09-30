@@ -133,6 +133,10 @@ env_variables: Dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_TOPK_TOPP_OPTIMIZATION":
     lambda: bool(
         int(os.getenv("VLLM_ASCEND_ENABLE_TOPK_TOPP_OPTIMIZATION", '0'))),
+    # Whether to enable top n sigma sampling
+    "VLLM_ASCEND_ENABLE_TOP_N_SIGMA":
+    lambda: bool(
+        int(os.getenv("VLLM_ASCEND_ENABLE_TOP_N_SIGMA", '0'))),
 }
 
 # end-env-vars-definition

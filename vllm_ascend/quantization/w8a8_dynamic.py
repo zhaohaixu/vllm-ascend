@@ -361,7 +361,6 @@ def fused_experts_with_allgather(hidden_states: torch.Tensor,
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
     num_tokens = hidden_states.shape[0]
     batch_size, hidden_size = hidden_states.shape
-    topk_weights = topk_weights.to(hidden_states.dtype)
 
     ep_group = get_ep_group().device_group
     ep_rank = torch.distributed.get_rank(group=ep_group)
@@ -385,16 +384,9 @@ def fused_experts_with_allgather(hidden_states: torch.Tensor,
             ep_rank * local_num_experts, (ep_rank + 1) * local_num_experts
         ],
         quant_mode=-1,
-        row_idx_type=1)
+        row_idx_type=0)
     group_list_type = 1
 
-    sorted_topk_weight = torch.index_select(topk_weights.view(-1), 0,
-                                            expanded_x_idx)
-    row_index = expanded_x_idx // topk_ids.shape[-1]
-    row_index = row_index.to(torch.int64)
-    share_input = torch.zeros((batch_size, hidden_size),
-                              dtype=torch.bfloat16,
-                              device="npu")
 
     hidden_states = torch_npu.npu_grouped_matmul(
         x=[hidden_states],
@@ -418,17 +410,27 @@ def fused_experts_with_allgather(hidden_states: torch.Tensor,
         quant_mode=1,
     )
 
-    final_hidden_states = torch_npu.npu_grouped_matmul_finalize_routing(
-        hidden_states,
-        w2,
-        scale=w2_scale.to(torch.float32),
-        bias=None,
-        pertoken_scale=pertoken_scale.view(-1),
+    hidden_states = torch_npu.npu_grouped_matmul(
+        x=[hidden_states],
+        weight=[w2],
+        scale=[w2_scale.to(torch.bfloat16)],
+        per_token_scale=[pertoken_scale.view(-1)],
+        split_item=3,
+        group_list_type=group_list_type,
+        group_type=0,
         group_list=expert_tokens,
-        shared_input=share_input,
-        logit=sorted_topk_weight.to(torch.float32),
-        row_index=row_index,
-        output_bs=batch_size).to(torch.bfloat16)
+        output_dtype=torch.bfloat16)[0]
+
+    final_hidden_states = torch_npu.npu_moe_finalize_routing(
+        expanded_permuted_rows=hidden_states.unsqueeze(1),
+        skip1=None,
+        skip2=None,
+        bias=None,
+        scales=topk_weights.to(torch.bfloat16),
+        expanded_src_to_dst_row=expanded_x_idx.to(torch.int32),
+        export_for_source_row=topk_ids,
+        drop_pad_mode=3
+    ).to(torch.bfloat16)
 
     if len(original_shape) == 3:
         final_hidden_states = final_hidden_states.view(original_shape)
@@ -714,9 +716,10 @@ class AscendW8A8DynamicFusedMoEMethod:
             1] == global_num_experts, "Number of global experts mismatch"
 
         is_deepseek_v3_r1 = global_num_experts == 256
+        use_grouped_topk = (topk_group > 1 or num_expert_group > 1)
 
         # NOTE: now npu_moe_gating_top_k can only support `group_count=256` pattern
-        if is_deepseek_v3_r1:
+        if use_grouped_topk and is_deepseek_v3_r1:
             topk_weights, topk_ids, _ = torch_npu.npu_moe_gating_top_k(
                 router_logits,
                 k=top_k,  # topk当前写8
@@ -818,8 +821,6 @@ class AscendW8A8DynamicFusedMoEMethod:
                 1, 2).contiguous()
             layer.w2_weight.data = layer.w2_weight.data.transpose(
                 1, 2).contiguous()
-        if envs.VLLM_ENABLE_FUSED_EXPERTS_ALLGATHER_EP:
-            torch_npu.npu_format_cast_(layer.w2_weight, ACL_FORMAT_FRACTAL_NZ)
         layer.w13_weight_scale.data = layer.w13_weight_scale.data.view(
             layer.w13_weight_scale.data.shape[0], -1)
         layer.w13_weight_offset.data = layer.w13_weight_offset.data.view(
