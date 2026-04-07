@@ -315,7 +315,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Merge all benchmark result artifacts
-        uses: actions/upload-artifact/merge@v4
+        uses: actions/upload-artifact/merge@v7
         with:
           name: nightly-a3
           pattern: nightly-test-benchmark-results-*
