@@ -233,9 +233,9 @@ constexpr int AES128_RK_PAD_BYTES = 192;              // 176B padded to 192B (32
 constexpr int MAX_BLOCKS_PER_CALL = 4096;             // best Process multiple blocks per core per call, half of chacha20
 
 
-class KernelAES128TTables {
+class KernelAESNaive {
 public:
-    __aicore__ inline KernelAES128TTables() {}
+    __aicore__ inline KernelAESNaive() {}
 
     __aicore__ inline void Init(__gm__ uint8_t* rk192,
                                 __gm__ uint8_t* in,
@@ -449,25 +449,25 @@ private:
     }
 };
 
-extern "C" __global__ __aicore__ void aes128_ecb_encrypt(
+extern "C" __global__ __aicore__ void aes_naive_generate_mask(
     __gm__ uint8_t* roundKeysPadded192, // GM: 192B (176B + padding)
     __gm__ uint8_t* input,              // GM: dataSize bytes
     __gm__ uint8_t* output,             // GM: dataSize bytes
 
     uint32_t dataSize)
 {
-    KernelAES128TTables op;
+    KernelAESNaive op;
     op.Init(roundKeysPadded192, input, output, dataSize);
     op.Process();
 }
 
 namespace vllm_ascend {
 // Host wrapper: blockDim = number of cores to use; stream is managed by caller
-extern void aes128_ecb_encrypt_do_impl(uint32_t blockDim, void* stream,
+extern void aes_naive_generate_mask_impl(uint32_t blockDim, void* stream,
                            void* roundKeysPadded192, void* input, void* output,
                            uint32_t dataSize)
 {
-    aes128_ecb_encrypt<<<blockDim, nullptr, stream>>>(
+    aes_naive_generate_mask<<<blockDim, nullptr, stream>>>(
         (__gm__ uint8_t*)roundKeysPadded192,
         (__gm__ uint8_t*)input,
         (__gm__ uint8_t*)output,

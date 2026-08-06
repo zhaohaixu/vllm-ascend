@@ -15,17 +15,73 @@
 # limitations under the License.
 #
 
-from typing import List, Optional, Union
+from functools import lru_cache
+from typing import Any, List, Optional, Union
 
 import os
 import torch
 import vllm
+from collections import namedtuple
 from torch.distributed import Backend
 from vllm.distributed.parallel_state import (GroupCoordinator,
                                              _get_unique_name, _register_group)
+from vllm.logger import logger
 
 from vllm_ascend.distributed.communicator import NPUCommunicator
 from vllm_ascend.utils import create_hccl_pg_options
+
+
+CHACHA20_NAIVE = "chacha20-naive"
+AES_NAIVE = "aes-naive"
+SUPPORTED_ENCRYPTION_ALGORITHMS = (CHACHA20_NAIVE, AES_NAIVE)
+
+
+@lru_cache(maxsize=1)
+def get_encryption_algorithm() -> Optional[str]:
+    """Parse VLLM_ENC_ENABLE once for each worker process.
+
+    The variable is intentionally parsed lazily because this module can be
+    imported before the worker process finishes setting up its environment.
+    """
+    configured_value = os.getenv("VLLM_ENC_ENABLE")
+    if configured_value is None:
+        return None
+
+    algorithm = configured_value.strip().lower()
+    if algorithm in SUPPORTED_ENCRYPTION_ALGORITHMS:
+        return algorithm
+
+    logger.warning(
+        "Unsupported VLLM_ENC_ENABLE=%r. Communication encryption is "
+        "disabled. Supported values are: %s.", configured_value,
+        ", ".join(SUPPORTED_ENCRYPTION_ALGORITHMS))
+    return None
+
+
+TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
+def _split_tensor_dict(
+    tensor_dict: dict[str, Union[torch.Tensor, Any]]
+) -> tuple[list[tuple[str, Any]], list[torch.Tensor]]:
+    """Split the tensor dictionary into two parts:
+    1. A list of (key, value) pairs. If the value is a tensor, it is replaced
+         by its metadata.
+    2. A list of tensors.
+    """
+    metadata_list: list[tuple[str, Any]] = []
+    tensor_list: list[torch.Tensor] = []
+    for key, value in tensor_dict.items():
+        if isinstance(value, torch.Tensor):
+            # Note: we cannot use `value.device` here,
+            # because it contains not only the device type but also the device
+            # index (e.g. "cuda:0"). We only need the device type.
+            # receiving side will set the device index.
+            device = value.device.type
+            metadata_list.append(
+                (key, TensorMetadata(device, value.dtype, value.size())))
+            tensor_list.append(value)
+        else:
+            metadata_list.append((key, value))
+    return metadata_list, tensor_list
 
 
 class GroupCoordinatorPatch(GroupCoordinator):
@@ -93,12 +149,121 @@ class GroupCoordinatorPatch(GroupCoordinator):
         self.use_custom_op_call = False
         self.use_cpu_custom_send_recv = False
 
-        self.element_count = 1024 * 1024 * 1024
-        self.key_stream = torch.rand(self.element_count, dtype=torch.int8, device=self.device)
-        self.key_stream_for_unalign = torch.rand(self.element_count, dtype=torch.int8, device=self.device)
-        self.is_enc = os.getenv("VLLM_ENC_ENABLE")
-        self.counter = 0
+        self.encryption_algorithm = get_encryption_algorithm()
+        self.is_enc = self.encryption_algorithm is not None
 
+        # Do not reserve key-stream buffers when encryption is disabled or the
+        # configured algorithm is invalid.
+        self.pool_size_collective = 1024 * 1024 * 1024
+        self.pool_size_p2p = 256 * 1024 * 1024
+        self.key_stream_for_align: Optional[torch.Tensor] = None
+        self.key_stream_for_unalign: Optional[torch.Tensor] = None
+        self.key_stream_for_send: Optional[torch.Tensor] = None
+        self.key_stream_for_recv: Optional[torch.Tensor] = None
+        if self.is_enc:
+            self.key_stream_for_align = torch.rand(
+                self.pool_size_collective,
+                dtype=torch.int8,
+                device=self.device)
+            self.key_stream_for_unalign = torch.rand(
+                self.pool_size_collective,
+                dtype=torch.int8,
+                device=self.device)
+            self.key_stream_for_send = torch.rand(
+                self.pool_size_p2p, dtype=torch.int8, device=self.device)
+            self.key_stream_for_recv = torch.rand(
+                self.pool_size_p2p, dtype=torch.int8, device=self.device)
+
+    def _crypt(self,
+               input_: torch.Tensor,
+               output: torch.Tensor,
+               is_encrypt: bool,
+               tp_size: int = 1) -> None:
+        if not self.is_enc:
+            return
+        assert self.key_stream_for_align is not None
+
+        if self.encryption_algorithm == CHACHA20_NAIVE:
+            torch.ops._C_ascend.chacha20_naive_encrypt_do(
+                self.key_stream_for_align, input_, output,
+                self.pool_size_collective, is_encrypt, tp_size)
+        elif self.encryption_algorithm == AES_NAIVE:
+            torch.ops._C_ascend.aes_naive_encrypt_do(
+                self.key_stream_for_align, input_, output,
+                self.pool_size_collective, is_encrypt, tp_size)
+
+    def _crypt_batch(self,
+                     input_: torch.Tensor,
+                     output: torch.Tensor,
+                     is_encrypt: bool,
+                     tp_size: int = 1) -> None:
+        if not self.is_enc:
+            return
+        assert self.key_stream_for_align is not None
+
+        if self.encryption_algorithm == CHACHA20_NAIVE:
+            torch.ops._C_ascend.chacha20_naive_encrypt_do_batch(
+                self.key_stream_for_align, input_, output,
+                self.pool_size_collective, is_encrypt, tp_size)
+        elif self.encryption_algorithm == AES_NAIVE:
+            torch.ops._C_ascend.aes_naive_encrypt_do_batch(
+                self.key_stream_for_align, input_, output,
+                self.pool_size_collective, is_encrypt, tp_size)
+
+    def _crypt_unalign(self,
+                       input_: torch.Tensor,
+                       output: torch.Tensor,
+                       is_encrypt: bool,
+                       tp_size: int = 1) -> None:
+        if not self.is_enc:
+            return
+        assert self.key_stream_for_unalign is not None
+
+        if self.encryption_algorithm == CHACHA20_NAIVE:
+            torch.ops._C_ascend.chacha20_naive_encrypt_do_unalign(
+                self.key_stream_for_unalign, input_, output,
+                self.pool_size_collective, is_encrypt, tp_size)
+        elif self.encryption_algorithm == AES_NAIVE:
+            torch.ops._C_ascend.aes_naive_encrypt_do_unalign(
+                self.key_stream_for_unalign, input_, output,
+                self.pool_size_collective, is_encrypt, tp_size)
+
+    def _crypt_send(self,
+                    input_: torch.Tensor,
+                    output: torch.Tensor,
+                    is_encrypt: bool,
+                    tp_size: int = 1) -> None:
+        if not self.is_enc:
+            return
+        assert self.key_stream_for_send is not None
+
+        if self.encryption_algorithm == CHACHA20_NAIVE:
+            torch.ops._C_ascend.chacha20_naive_encrypt_do_send(
+                self.key_stream_for_send, input_, output,
+                self.pool_size_p2p, is_encrypt, tp_size)
+        elif self.encryption_algorithm == AES_NAIVE:
+            torch.ops._C_ascend.aes_naive_encrypt_do_send(
+                self.key_stream_for_send, input_, output,
+                self.pool_size_p2p, is_encrypt, tp_size)
+
+    def _crypt_recv(self,
+                    input_: torch.Tensor,
+                    output: torch.Tensor,
+                    is_encrypt: bool,
+                    tp_size: int = 1) -> None:
+        if not self.is_enc:
+            return
+        assert self.key_stream_for_recv is not None
+
+        if self.encryption_algorithm == CHACHA20_NAIVE:
+            torch.ops._C_ascend.chacha20_naive_encrypt_do_recv(
+                self.key_stream_for_recv, input_, output,
+                self.pool_size_p2p, is_encrypt, tp_size)
+        elif self.encryption_algorithm == AES_NAIVE:
+            torch.ops._C_ascend.aes_naive_encrypt_do_recv(
+                self.key_stream_for_recv, input_, output,
+                self.pool_size_p2p, is_encrypt, tp_size)
+    
     def all_to_all(self,
                    input_: torch.Tensor,
                    scatter_dim: int = 0,
@@ -142,12 +307,13 @@ class GroupCoordinatorPatch(GroupCoordinator):
                                     dtype=input_.dtype,
                                     device=input_.device)
         # All-gather.
-        if self.is_enc is not None:
-            torch.ops._C_ascend.chacha20_encrypt_do_unalign(self.key_stream_for_unalign, input_, input_, self.element_count, True, 1)
+        if self.is_enc:
+            self._crypt_unalign(input_, input_, True, 1)
             torch.distributed.all_gather_into_tensor(output_tensor,
                                                      input_,
                                                      group=self.device_group)
-            torch.ops._C_ascend.chacha20_encrypt_do_unalign(self.key_stream_for_unalign, output_tensor, output_tensor, self.element_count, False, self.world_size)
+            self._crypt_unalign(output_tensor, output_tensor, False,
+                                self.world_size)
         else:
             torch.distributed.all_gather_into_tensor(output_tensor,
                                                      input_,
@@ -181,69 +347,197 @@ class GroupCoordinatorPatch(GroupCoordinator):
         if self.world_size == 1:
             return input_
 
-        # chacha20_encrypt_do!!
-        if self.is_enc is not None:
-            torch.ops._C_ascend.chacha20_encrypt_do(self.key_stream, input_, input_, self.element_count, True, 1)
-            # self.current_pos = torch.ops._C_ascend.chacha20_encrypt_do(self.key_stream, input_, input_, self.element_count, self.current_pos, True, 1)
+        if self.is_enc:
+            self._crypt(input_, input_, True, 1)
         output_ =  self.device_communicator.all_gather(input_, 0)
         single_batch = output_.size(0) // self.world_size
         new_shape = (self.world_size, single_batch, *output_.shape[1:])
         reshaped = output_.view(*new_shape)
-        if self.is_enc is not None:
-            torch.ops._C_ascend.chacha20_encrypt_do_batch(self.key_stream, reshaped, reshaped, self.element_count, False, self.world_size)
-            # self.current_pos = torch.ops._C_ascend.chacha20_encrypt_do(self.key_stream, reshaped, reshaped, self.element_count, self.current_pos, False, self.world_size)
+        if self.is_enc:
+            self._crypt_batch(reshaped, reshaped, False, self.world_size)
         reduced_sum = reshaped.sum(dim=0)
         reduced_sum = reduced_sum.view(input_.shape)
         return reduced_sum
-    
-    def gather(self,
-               input_: torch.Tensor,
-               dst: int = 0,
-               dim: int = -1) -> Optional[torch.Tensor]:
+
+    def send_tensor_dict(
+        self,
+        tensor_dict: dict[str, Union[torch.Tensor, Any]],
+        dst: Optional[int] = None,
+        all_gather_group: Optional["GroupCoordinator"] = None,
+        all_gather_tensors: Optional[dict[str, bool]] = None,
+    ) -> Optional[dict[str, Union[torch.Tensor, Any]]]:
+        """Send the input tensor dictionary.
+        NOTE: `dst` is the local rank of the source rank.
+
+        all_gather_group: The group for the all-gather operation. If provided,
+            an optimization is enabled where each rank in the group sends a
+            slice of a tensor and the receiver reconstructs it using an
+            all-gather, which can improve performance. This is typically the
+            tensor-parallel group.
+        all_gather_tensors: A dictionary to specify which tensors should use
+            the all-gather optimization, which is only effective when
+            `all_gather_group` is provided. By default, this optimization is
+            on for any tensor whose size is divisible by the
+            `all_gather_group`'s world size. However, it should be disabled
+            for tensors that are not fully replicated across the group (e.g.,
+            the residual tensor when sequence parallelism is enabled). This
+            dictionary allows overriding the default behavior on a per-tensor
+            basis.
         """
-        NOTE: We assume that the input tensor is on the same device across
-        all the ranks.
-        NOTE: `dst` is the local rank of the destination rank.
-        """
-        world_size = self.world_size
         # Bypass the function if we are using only 1 GPU.
-        if world_size == 1:
-            return input_
-        if self.is_enc is not None:
-            torch.ops._C_ascend.chacha20_encrypt_do(self.key_stream, input_, input_, self.element_count, True, 1)
-            # self.current_pos = torch.ops._C.chacha20_encrypt_do(self.key_stream, input_, input_, self.element_count, self.current_pos, True, 1)
-        output = self.device_communicator.all_gather(input_, dim)
-        # output = self.device_communicator.gather(input_, dst, dim)
-        if self.rank_in_group == dst:
-            if self.is_enc is not None:
-                torch.ops._C_ascend.chacha20_encrypt_do(self.key_stream, output, output, self.element_count, False, self.world_size)
-                # self.current_pos = torch.ops._C.chacha20_encrypt_do(self.key_stream, output, output, self.element_count, self.current_pos, False, self.world_size)
-            return output
-        else:
-            if self.is_enc is not None:
-                torch.ops._C_ascend.chacha20_encrypt_do(self.key_stream, input_, input_, self.element_count, False, 1)
-                # self.current_pos = torch.ops._C.chacha20_encrypt_do(self.key_stream, input_, input_, self.element_count, self.current_pos, False, 1)
-            return input_
+        if not torch.distributed.is_initialized() or self.world_size == 1:
+            return tensor_dict
+        all_gather_size = (1 if all_gather_group is None else
+                        all_gather_group.world_size)
+        all_gather_rank = (0 if all_gather_group is None else
+                        all_gather_group.rank_in_group)
 
-    def send(self, tensor: torch.Tensor, dst: Optional[int] = None) -> None:
-        """Sends a tensor to the destination rank in a non-blocking way"""
-        """NOTE: `dst` is the local rank of the destination rank."""
-        if self.is_enc is not None:
-            torch.ops._C_ascend.chacha20_encrypt_do(self.key_stream, tensor, tensor, self.element_count, True, 1)
-            # self.current_pos = torch.ops._C.chacha20_encrypt_do(self.key_stream, tensor, tensor, self.element_count, self.current_pos, True, 1)
-        self.device_communicator.send(tensor, dst)
+        group = self.device_group
+        metadata_group = self.cpu_group
 
-    def recv(self,
-             size: torch.Size,
-             dtype: torch.dtype,
-             src: Optional[int] = None) -> torch.Tensor:
-        """Receives a tensor from the source rank."""
-        """NOTE: `src` is the local rank of the source rank."""
-        output_ = self.device_communicator.recv(size, dtype, src)
-        if self.is_enc is not None:
-            torch.ops._C_ascend.chacha20_encrypt_do(self.key_stream, output_, output_, self.element_count, False, 1)
-            # self.current_pos = torch.ops._C.chacha20_encrypt_do(self.key_stream, output_, output_, self.element_count, self.current_pos, False, 1)
-        return output_
+        if dst is None:
+            dst = (self.rank_in_group + 1) % self.world_size
+        assert dst < self.world_size, f"Invalid dst rank ({dst})"
+
+        if self.use_cpu_custom_send_recv:
+            if self.device_communicator is None:
+                raise ValueError("No device communicator found")
+            self.device_communicator.send_tensor_dict(  # type: ignore
+                tensor_dict, dst)
+            return None
+
+        metadata_list: list[tuple[Any, Any]] = []
+        assert isinstance(
+            tensor_dict,
+            dict), f"Expecting a dictionary, got {type(tensor_dict)}"
+        metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
+        # `metadata_list` lives in CPU memory.
+        # `send_object_list` has serialization & deserialization,
+        # all happening on CPU. Therefore, we can use the CPU group.
+        self.send_object(metadata_list, dst=dst)
+
+        tensor_keys = [
+            k for k, v in tensor_dict.items() if isinstance(v, torch.Tensor)
+        ]
+        assert len(tensor_keys) == len(tensor_list)
+
+        for key, tensor in zip(tensor_keys, tensor_list):
+            if tensor.numel() == 0:
+                # Skip sending empty tensors.
+                continue
+
+            # send-allgather: send only a slice, then do allgather.
+            use_all_gather = (all_gather_group is not None
+                            and tensor.numel() % all_gather_size == 0)
+            use_all_gather = all_gather_tensors.get(key, use_all_gather) \
+                if all_gather_tensors else use_all_gather
+            if use_all_gather:
+                tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
+
+            if tensor.is_cpu:
+                # use metadata_group for CPU tensors
+                torch.distributed.send(tensor,
+                                    dst=self.ranks[dst],
+                                    group=metadata_group)
+            else:
+                # use group for GPU tensors
+                if self.is_enc:
+                    self._crypt_send(tensor, tensor, True, 1)
+                torch.distributed.send(tensor,
+                                       dst=self.ranks[dst],
+                                       group=group)
+        return None
+
+    def recv_tensor_dict(
+        self,
+        src: Optional[int] = None,
+        all_gather_group: Optional["GroupCoordinator"] = None,
+        all_gather_tensors: Optional[dict[str, bool]] = None,
+    ) -> Optional[dict[str, Union[torch.Tensor, Any]]]:
+        """Recv the input tensor dictionary.
+        NOTE: `src` is the local rank of the source rank.
+
+        all_gather_group: The group for the all-gather operation. If provided,
+            an optimization is enabled where each rank in the group sends a
+            slice of a tensor and the receiver reconstructs it using an
+            all-gather, which can improve performance. This is typically the
+            tensor-parallel group.
+        all_gather_tensors: A dictionary to specify which tensors should use
+            the all-gather optimization, which is only effective when
+            `all_gather_group` is provided. By default, this optimization is
+            on for any tensor whose size is divisible by the
+            `all_gather_group`'s world size. However, it should be disabled
+            for tensors that are not fully replicated across the group (e.g.,
+            the residual tensor when sequence parallelism is enabled). This
+            dictionary allows overriding the default behavior on a per-tensor
+            basis.
+        """
+        # Bypass the function if we are using only 1 GPU.
+        if not torch.distributed.is_initialized() or self.world_size == 1:
+            return None
+        all_gather_size = (1 if all_gather_group is None else
+                        all_gather_group.world_size)
+        all_gather_rank = (0 if all_gather_group is None else
+                        all_gather_group.rank_in_group)
+
+        group = self.device_group
+        metadata_group = self.cpu_group
+
+        if src is None:
+            src = (self.rank_in_group - 1) % self.world_size
+        assert src < self.world_size, f"Invalid src rank ({src})"
+
+        if self.use_cpu_custom_send_recv:
+            if self.device_communicator is None:
+                raise ValueError("No device communicator found")
+            return self.device_communicator.recv_tensor_dict(  # type: ignore
+                src)
+
+        recv_metadata_list = self.recv_object(src=src)
+        tensor_dict: dict[str, Any] = {}
+        for key, value in recv_metadata_list:
+            if isinstance(value, TensorMetadata):
+                tensor = torch.empty(value.size,
+                                    dtype=value.dtype,
+                                    device=value.device)
+                if tensor.numel() == 0:
+                    # Skip broadcasting empty tensors.
+                    tensor_dict[key] = tensor
+                    continue
+
+                # send-allgather: send only a slice, then do allgather.
+                use_all_gather = (all_gather_group is not None
+                                and tensor.numel() % all_gather_size == 0)
+                use_all_gather = all_gather_tensors.get(key, use_all_gather) \
+                    if all_gather_tensors else use_all_gather
+
+                if use_all_gather:
+                    orig_shape = tensor.shape
+                    tensor = tensor.reshape(all_gather_size,
+                                            -1)[all_gather_rank]
+
+                if tensor.is_cpu:
+                    # use metadata_group for CPU tensors
+                    torch.distributed.recv(tensor,
+                                        src=self.ranks[src],
+                                        group=metadata_group)
+                else:
+                    # use group for GPU tensors
+                    torch.distributed.recv(tensor,
+                                           src=self.ranks[src],
+                                           group=group)
+                    if self.is_enc:
+                        self._crypt_recv(tensor, tensor, True, 1)
+                if use_all_gather:
+                    # do the allgather
+                    tensor = all_gather_group.all_gather(  # type: ignore
+                        tensor, dim=0)
+                    tensor = tensor.reshape(orig_shape)
+
+                tensor_dict[key] = tensor
+            else:
+                tensor_dict[key] = value
+        return tensor_dict
 
 
 vllm.distributed.parallel_state.GroupCoordinator = GroupCoordinatorPatch

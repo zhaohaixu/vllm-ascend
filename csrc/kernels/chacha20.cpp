@@ -20,9 +20,9 @@ using namespace AscendC;
 constexpr int BLOCK_SIZE = 64; 
 constexpr int MAX_BLOCKS_PER_CALL = 2048;
 
-class KernelChaCha20Optimized {  
+class KernelXorOptimized {  
 public:  
-    __aicore__ inline KernelChaCha20Optimized() {}  
+    __aicore__ inline KernelXorOptimized() {}  
 
     __aicore__ inline void Init(__gm__ void* state, __gm__ void* input, __gm__ void* output, uint32_t dataSize, uint32_t workspaceSize)  
     {  
@@ -113,9 +113,9 @@ private:
     int DOUBLE_BUFFER_SIZE = 1024;
 };
 
-class KernelChaCha20OptimizedBatched {  
+class KernelXorOptimizedBatched {  
 public:  
-    __aicore__ inline KernelChaCha20OptimizedBatched() {}  
+    __aicore__ inline KernelXorOptimizedBatched() {}  
 
     __aicore__ inline void Init(__gm__ void* state, __gm__ void* input, __gm__ void* output, uint32_t dataSize, uint32_t batchSize, uint32_t workspaceSize)  
     {  
@@ -214,9 +214,9 @@ private:
     int DOUBLE_BUFFER_SIZE = 1024;
 };
 
-class KernelChaCha20Optimized_for_h2d {  
+class KernelXorOptimizedUnalign {  
 public:  
-    __aicore__ inline KernelChaCha20Optimized_for_h2d() {}  
+    __aicore__ inline KernelXorOptimizedUnalign() {}  
 
     __aicore__ inline void Init(__gm__ uint16_t* state, __gm__ uint16_t* input, __gm__ uint16_t* output, uint32_t dataSize, uint32_t workspace)  
     {  
@@ -341,202 +341,9 @@ private:
     int DOUBLE_BUFFER_SIZE = 1024;
 };
 
-// class KernelChaCha20Generation {  
-// public:  
-//     __aicore__ inline KernelChaCha20Generation() {}  
-
-//     // 优化的并行四轮运算 - 减少内存访问
-//     __aicore__ inline void parallelQuarterRounds(uint32_t* state,
-//                                                int a1, int b1, int c1, int d1,
-//                                                int a2, int b2, int c2, int d2,
-//                                                int a3, int b3, int c3, int d3,
-//                                                int a4, int b4, int c4, int d4)
-//     {
-//         // 批量读取，减少内存访问
-//         uint32_t va1 = state[a1], vb1 = state[b1], vc1 = state[c1], vd1 = state[d1];
-//         uint32_t va2 = state[a2], vb2 = state[b2], vc2 = state[c2], vd2 = state[d2];
-//         uint32_t va3 = state[a3], vb3 = state[b3], vc3 = state[c3], vd3 = state[d3];
-//         uint32_t va4 = state[a4], vb4 = state[b4], vc4 = state[c4], vd4 = state[d4];
-
-//         // 第一步
-//         va1 += vb1; vd1 ^= va1; vd1 = (vd1 << 16) | (vd1 >> 16);
-//         va2 += vb2; vd2 ^= va2; vd2 = (vd2 << 16) | (vd2 >> 16);
-//         va3 += vb3; vd3 ^= va3; vd3 = (vd3 << 16) | (vd3 >> 16);
-//         va4 += vb4; vd4 ^= va4; vd4 = (vd4 << 16) | (vd4 >> 16);
-        
-//         // 第二步
-//         vc1 += vd1; vb1 ^= vc1; vb1 = (vb1 << 12) | (vb1 >> 20);
-//         vc2 += vd2; vb2 ^= vc2; vb2 = (vb2 << 12) | (vb2 >> 20);
-//         vc3 += vd3; vb3 ^= vc3; vb3 = (vb3 << 12) | (vb3 >> 20);
-//         vc4 += vd4; vb4 ^= vc4; vb4 = (vb4 << 12) | (vb4 >> 20);
-        
-//         // 第三步
-//         va1 += vb1; vd1 ^= va1; vd1 = (vd1 << 8) | (vd1 >> 24);
-//         va2 += vb2; vd2 ^= va2; vd2 = (vd2 << 8) | (vd2 >> 24);
-//         va3 += vb3; vd3 ^= va3; vd3 = (vd3 << 8) | (vd3 >> 24);
-//         va4 += vb4; vd4 ^= va4; vd4 = (vd4 << 8) | (vd4 >> 24);
-        
-//         // 第四步
-//         vc1 += vd1; vb1 ^= vc1; vb1 = (vb1 << 7) | (vb1 >> 25);
-//         vc2 += vd2; vb2 ^= vc2; vb2 = (vb2 << 7) | (vb2 >> 25);
-//         vc3 += vd3; vb3 ^= vc3; vb3 = (vb3 << 7) | (vb3 >> 25);
-//         vc4 += vd4; vb4 ^= vc4; vb4 = (vb4 << 7) | (vb4 >> 25);
-        
-//         // 批量写入
-//         state[a1] = va1; state[b1] = vb1; state[c1] = vc1; state[d1] = vd1;
-//         state[a2] = va2; state[b2] = vb2; state[c2] = vc2; state[d2] = vd2;
-//         state[a3] = va3; state[b3] = vb3; state[c3] = vc3; state[d3] = vd3;
-//         state[a4] = va4; state[b4] = vb4; state[c4] = vc4; state[d4] = vd4;
-//     }
-
-//     __aicore__ inline void Init(__gm__ void* state, __gm__ void* output, uint32_t dataSize)  
-//     {  
-//         stateGlobal.SetGlobalBuffer((__gm__ uint32_t*)state);  
-//         outputGlobal.SetGlobalBuffer((__gm__ uint8_t*)output + AscendC::GetBlockIdx() * (dataSize / AscendC::GetBlockNum()));
-//         this->dataSize = dataSize;  
-//         this->totalBlocks = (dataSize + BLOCK_SIZE - 1) / BLOCK_SIZE;  
-//         this->localBlocks = (dataSize + BLOCK_SIZE - 1) / BLOCK_SIZE / AscendC::GetBlockNum();  
-        
-//         // 增加缓冲区大小
-//         pipe.InitBuffer(stateQueue, 1, 16 * sizeof(uint32_t));   
-//         pipe.InitBuffer(outputQueue, 2, DOUBLE_BUFFER_SIZE);  
-//         pipe.InitBuffer(workingQueue, 2, 16 * sizeof(uint32_t));  
-//     }  
-    
-//     __aicore__ inline void Process()
-//     {  
-//         uint32_t threadId = AscendC::GetBlockIdx();  
-//         uint32_t threadNum = AscendC::GetBlockNum();  
-//         uint32_t dataSizePerThread = dataSize / threadNum;
-//         uint32_t blocksToProcess = min(static_cast<uint32_t>(DOUBLE_BUFFER_SIZE), dataSizePerThread);
-
-//         AscendC::LocalTensor<uint32_t> stateLocal = stateQueue.AllocTensor<uint32_t>();  
-//         DataCopy(stateLocal, stateGlobal, 16);  
-//         for (int i = 0; i < 16; i++) {
-//             localState[i] = stateLocal.GetValue(i);
-//         }
-        
-//         for (uint32_t i = 0; i < dataSizePerThread; i += blocksToProcess){
-//             blocksToProcess = min(static_cast<uint32_t>(DOUBLE_BUFFER_SIZE), dataSizePerThread - i);
-//             if (blocksToProcess > 0) {  
-//                 ComputeVectorized(i / BLOCK_SIZE, blocksToProcess / BLOCK_SIZE);
-//                 CopyOut(i / BLOCK_SIZE, blocksToProcess / BLOCK_SIZE);  
-//             }  
-//         }
-
-//         stateQueue.FreeTensor(stateLocal);
-//     }
-
-// private:  
-//     uint32_t dataSize;  
-//     uint32_t totalBlocks;  
-//     uint32_t localBlocks;
-//     uint32_t localState[16];  // 本地状态缓存
-    
-//     __aicore__ inline void CopyIn(uint32_t startBlock, uint32_t blocksToProcess)  
-//     {  
-//         AscendC::LocalTensor<uint32_t> stateLocal = stateQueue.DeQue<uint32_t>();  
-//         stateQueue.EnQue(stateLocal);  
-//     }  
-    
-//     // 优化的计算函数 - 使用本地数组减少内存访问
-//     __aicore__ inline void ComputeVectorized(uint32_t startBlock, uint32_t blocksToProcess)  
-//     {   
-//         AscendC::LocalTensor<uint8_t> outputLocal = outputQueue.AllocTensor<uint8_t>();
-        
-//         for (uint32_t block = 0; block < blocksToProcess; block++) {
-//             // 快速初始化工作状态
-//             uint32_t workingState[16];
-//             for (int i = 0; i < 16; i++) {
-//                 workingState[i] = localState[i];
-//             }
-            
-//             workingState[12] += startBlock + block;
-            
-//             // 优化的ChaCha20块变换
-//             ChaCha20BlockOptimized(workingState);
-            
-//             // 优化的XOR操作
-//             fastXOR(workingState, outputLocal, block * BLOCK_SIZE);
-//         }
-        
-//         outputQueue.EnQue<uint8_t>(outputLocal);
-//     }
-    
-//     // 优化的ChaCha20块变换
-//     __aicore__ inline void ChaCha20BlockOptimized(uint32_t* state)
-//     {
-//         uint32_t originalState[16];
-//         // 批量拷贝
-//         for (int i = 0; i < 16; i++) {
-//             originalState[i] = state[i];
-//         }
-        
-//         // 展开前两轮以减少循环开销
-//         parallelQuarterRounds(state, 0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15); 
-//         parallelQuarterRounds(state, 0, 5, 10, 15, 1, 6, 11, 12, 2, 7, 8, 13, 3, 4, 9, 14);
-//         parallelQuarterRounds(state, 0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15); 
-//         parallelQuarterRounds(state, 0, 5, 10, 15, 1, 6, 11, 12, 2, 7, 8, 13, 3, 4, 9, 14);
-        
-//         // 剩余轮次
-//         for (int round = 2; round < 10; round++) {
-//             parallelQuarterRounds(state, 0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15); 
-//             parallelQuarterRounds(state, 0, 5, 10, 15, 1, 6, 11, 12, 2, 7, 8, 13, 3, 4, 9, 14);  
-//         }
-        
-//         // 批量加法
-//         for (int i = 0; i < 16; i++) {
-//             state[i] += originalState[i];
-//         }
-//     }
-    
-//     // 优化的XOR操作 - 直接使用指针访问
-//     __aicore__ inline void fastXOR(uint32_t* keystream, 
-//                                   AscendC::LocalTensor<uint8_t>& output, uint32_t blockOffset)
-//     {
-//         // 按64字节块处理，4字节对齐
-//         for (int i = 0; i < 16; i++) {
-//             uint32_t wordOffset = blockOffset + i * 4;
-            
-//             if (wordOffset + 3 < this->localBlocks * BLOCK_SIZE) {
-//                 uint32_t outputWord = keystream[i];
-                
-//                 output.SetValue(wordOffset + 0, uint8_t(outputWord));
-//                 output.SetValue(wordOffset + 1, uint8_t(outputWord >> 8));
-//                 output.SetValue(wordOffset + 2, uint8_t(outputWord >> 16));
-//                 output.SetValue(wordOffset + 3, uint8_t(outputWord >> 24));
-//             }
-//         }
-//     }
-    
-//     __aicore__ inline void CopyOut(uint32_t startBlock, uint32_t blocksToProcess)
-//     {
-//         AscendC::LocalTensor<uint8_t> outputLocal = outputQueue.DeQue<uint8_t>();
-        
-//         uint32_t outputOffset = startBlock * BLOCK_SIZE;
-//         uint32_t outputSize = blocksToProcess * BLOCK_SIZE;
-        
-//         if (outputOffset + outputSize > dataSize) {
-//             outputSize = dataSize - outputOffset;
-//         }
-        
-//         AscendC::DataCopy(outputGlobal[outputOffset], outputLocal, outputSize);
-//         outputQueue.FreeTensor(outputLocal);
-//     }
-    
-// private:
-//     AscendC::TPipe pipe;
-//     AscendC::TQue<AscendC::TPosition::VECIN, 1> stateQueue;
-//     AscendC::TQue<AscendC::TPosition::VECOUT, 2> outputQueue;
-//     AscendC::TQue<AscendC::TPosition::VECIN, 2> workingQueue;
-//     AscendC::GlobalTensor<uint32_t> stateGlobal;
-//     AscendC::GlobalTensor<uint8_t> outputGlobal;
-//     int DOUBLE_BUFFER_SIZE = 1024;
-// };
-
-class KernelChaCha20Generation {  
+class KernelChaCha20NaiveGeneration {  
 public:  
-    __aicore__ inline KernelChaCha20Generation() {}  
+    __aicore__ inline KernelChaCha20NaiveGeneration() {}  
 
     // 优化的并行四轮运算 - 减少内存访问
     __aicore__ inline void parallelQuarterRounds(uint32_t* state,
@@ -718,19 +525,19 @@ private:
     AscendC::GlobalTensor<uint8_t> outputGlobal;
 };
 
-extern "C" __global__ __aicore__ void chacha20_encrypt_optimized(
+extern "C" __global__ __aicore__ void xor_optimized(
     __gm__ uint16_t* state, 
     __gm__ uint16_t* input, 
     __gm__ uint16_t* output, 
     uint32_t dataSize,
     uint32_t workspaceSize)
 {
-    KernelChaCha20Optimized op;
+    KernelXorOptimized op;
     op.Init(state, input, output, dataSize, workspaceSize);
     op.Process();
 }
 
-extern "C" __global__ __aicore__ void chacha20_encrypt_optimized_batch(
+extern "C" __global__ __aicore__ void xor_optimized_batch(
     __gm__ uint16_t* state, 
     __gm__ uint16_t* input, 
     __gm__ uint16_t* output, 
@@ -738,38 +545,38 @@ extern "C" __global__ __aicore__ void chacha20_encrypt_optimized_batch(
     uint32_t batchSize,
     uint32_t workspaceSize)
 {
-    KernelChaCha20OptimizedBatched op;
+    KernelXorOptimizedBatched op;
     op.Init(state, input, output, dataSize, batchSize, workspaceSize);
     op.Process();
 }
 
-extern "C" __global__ __aicore__ void chacha20_encrypt_optimized_unalign(
+extern "C" __global__ __aicore__ void xor_optimized_unalign(
     __gm__ uint16_t* state, 
     __gm__ uint16_t* input, 
     __gm__ uint16_t* output, 
     uint32_t dataSize,
     uint32_t workspaceSize)
 {
-    KernelChaCha20Optimized_for_h2d op;
+    KernelXorOptimizedUnalign op;
     op.Init(state, input, output, dataSize, workspaceSize);
     op.Process();
 }
 
-extern "C" __global__ __aicore__ void chacha20_encrypt_generation(
+extern "C" __global__ __aicore__ void chacha20_naive_generation(
     __gm__ void* state, 
     __gm__ void* output, 
     uint32_t dataSize)
 {
-    KernelChaCha20Generation op;
+    KernelChaCha20NaiveGeneration op;
     op.Init(state, output, dataSize);
     op.Process();
 }
 
 namespace vllm_ascend {
 
-extern void chacha20_encrypt_do_impl(void *stream, void* state, void* input, void* output, uint32_t dataSize, uint32_t workspaceSize)
+extern void xor_do_impl(void *stream, void* state, void* input, void* output, uint32_t dataSize, uint32_t workspaceSize)
 {
-    chacha20_encrypt_optimized<<<32, nullptr, stream>>>(
+    xor_optimized<<<32, nullptr, stream>>>(
         state, 
         input, 
         output, 
@@ -777,9 +584,9 @@ extern void chacha20_encrypt_do_impl(void *stream, void* state, void* input, voi
         workspaceSize);
 }
 
-extern void chacha20_encrypt_do_batch_impl(void *stream, void* state, void* input, void* output, uint32_t dataSize, uint32_t batchSize, uint32_t workspaceSize)
+extern void xor_do_batch_impl(void *stream, void* state, void* input, void* output, uint32_t dataSize, uint32_t batchSize, uint32_t workspaceSize)
 {
-    chacha20_encrypt_optimized_batch<<<32, nullptr, stream>>>(
+    xor_optimized_batch<<<32, nullptr, stream>>>(
         state, 
         input, 
         output, 
@@ -788,9 +595,9 @@ extern void chacha20_encrypt_do_batch_impl(void *stream, void* state, void* inpu
         workspaceSize);
 }
 
-extern void chacha20_encrypt_do_unalign_impl(void *stream, void* state, void* input, void* output, uint32_t dataSize, uint32_t workspaceSize)
+extern void xor_do_unalign_impl(void *stream, void* state, void* input, void* output, uint32_t dataSize, uint32_t workspaceSize)
 {
-    chacha20_encrypt_optimized_unalign<<<32, nullptr, stream>>>(
+    xor_optimized_unalign<<<32, nullptr, stream>>>(
         state, 
         input, 
         output, 
@@ -798,9 +605,9 @@ extern void chacha20_encrypt_do_unalign_impl(void *stream, void* state, void* in
         workspaceSize);
 }
 
-extern void chacha20_encrypt_generate_mask_impl(uint32_t blockDim, void *stream, void* state, void* output, uint32_t dataSize)
+extern void chacha20_naive_generate_mask_impl(uint32_t blockDim, void *stream, void* state, void* output, uint32_t dataSize)
 {
-    chacha20_encrypt_generation<<<blockDim, nullptr, stream>>>(
+    chacha20_naive_generation<<<blockDim, nullptr, stream>>>(
         state, 
         output, 
         dataSize);

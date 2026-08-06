@@ -159,7 +159,7 @@ namespace vllm_ascend {
         const uint32_t block_dim
     );
 
-    extern void chacha20_encrypt_do_impl(
+    extern void xor_do_impl(
         void *stream, 
         void* state, 
         void* input, 
@@ -167,7 +167,7 @@ namespace vllm_ascend {
         uint32_t dataSize,
         uint32_t workspaceSize);
     
-    extern void chacha20_encrypt_do_batch_impl(
+    extern void xor_do_batch_impl(
         void *stream, 
         void* state, 
         void* input, 
@@ -176,7 +176,7 @@ namespace vllm_ascend {
         uint32_t batchSize,
         uint32_t workspaceSize);
 
-    extern void chacha20_encrypt_do_unalign_impl(
+    extern void xor_do_unalign_impl(
         void *stream, 
         void* state, 
         void* input, 
@@ -184,14 +184,14 @@ namespace vllm_ascend {
         uint32_t dataSize,
         uint32_t workspaceSize);
 
-    extern void chacha20_encrypt_generate_mask_impl(
+    extern void chacha20_naive_generate_mask_impl(
         uint32_t blockDim, 
         void *stream, 
         void* state, 
         void* output, 
         uint32_t dataSize);
 
-    extern void aes128_ecb_encrypt_do_impl(
+    extern void aes_naive_generate_mask_impl(
         uint32_t blockDim,
         void* stream,
         void* roundKeysPadded192,

@@ -34,6 +34,8 @@ namespace vllm_ascend {
 aclrtStream enc_stream;
 int64_t current_pos = -1;
 int64_t current_pos_unalign = -1;
+int64_t current_pos_send = -1;
+int64_t current_pos_recv = -1;
 
 int32_t nounce_counter = []() {
     std::random_device rd;
@@ -43,7 +45,8 @@ int32_t nounce_counter = []() {
 }();
 
 constexpr int AES_BLOCK_SIZE = 16;
-constexpr int MAX_BLOCKS_PER_CALL = 4096;
+constexpr int AES_MAX_BLOCKS_PER_CALL = 4096;
+constexpr int CHACHA20_MAX_BLOCKS_PER_CALL = 2048;
 constexpr int AES128_RK_BYTES = 16 * (10 + 1);
 constexpr int AES128_RK_PAD_BYTES = 192;
 
@@ -557,7 +560,7 @@ at::Tensor sgmv_expand(at::Tensor &x, at::Tensor &weight, at::Tensor &lora_indic
     return y_out;
 }
 
-void chacha20_encrypt_do(
+void chacha20_naive_encrypt_do(
     at::Tensor &key_stream, 
     at::Tensor &input, 
     at::Tensor &output,
@@ -573,11 +576,9 @@ void chacha20_encrypt_do(
     char* output_ptr = (char*)output.data_ptr();
     uint8_t* base_ptr = reinterpret_cast<uint8_t*>(key_stream.data_ptr());
     int64_t data_size = input.nbytes();
-    int64_t threadnum = element_count / 64 / 2048;
+    int64_t threadnum = element_count / 64 / CHACHA20_MAX_BLOCKS_PER_CALL;
 
     uint32_t maxValue = 4096;
-
-    // bool exists = std::find(intVector.begin(), intVector.end(), data_size) != intVector.end();
 
     if (!enc_stream) {
         enc_stream = c10_npu::getCurrentNPUStream().stream();
@@ -587,9 +588,9 @@ void chacha20_encrypt_do(
         at::Tensor state = at::rand({64}, key_stream.options());
         void* state_ptr = state.data_ptr();
         at_npu::native::OpCommand cmd;
-        cmd.Name("chacha20_encrypt_generate_mask");
+        cmd.Name("chacha20_naive_generate_mask");
         cmd.SetCustomHandler([threadnum, state_ptr, base_ptr, element_count]() -> int {
-            chacha20_encrypt_generate_mask_impl(threadnum, enc_stream, state_ptr, base_ptr, element_count);
+            chacha20_naive_generate_mask_impl(threadnum, enc_stream, state_ptr, base_ptr, element_count);
             return 0;
         });
         cmd.Run();
@@ -599,11 +600,11 @@ void chacha20_encrypt_do(
     void* key_stream_ptr = base_ptr + current_pos;
     for (int i = 0; i < tp_size; i++) {
         at_npu::native::OpCommand cmd;
-        cmd.Name("chacha20_encrypt_do");
+        cmd.Name("xor_do");
         void* input_ptr_ = (void*)(input_ptr + i * (data_size / tp_size));
         void* output_ptr_ = (void*)(output_ptr + i * (data_size / tp_size));
         cmd.SetCustomHandler([key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
-            chacha20_encrypt_do_impl(enc_stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
+            xor_do_impl(enc_stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
             return 0;
         });
         cmd.Run();
@@ -616,7 +617,7 @@ void chacha20_encrypt_do(
     return;
 }
 
-void chacha20_encrypt_do_batch(
+void chacha20_naive_encrypt_do_batch(
     at::Tensor &key_stream, 
     at::Tensor &input, 
     at::Tensor &output,
@@ -632,11 +633,9 @@ void chacha20_encrypt_do_batch(
     char* output_ptr = (char*)output.data_ptr();
     uint8_t* base_ptr = reinterpret_cast<uint8_t*>(key_stream.data_ptr());
     int64_t data_size = input.nbytes();
-    int64_t threadnum = element_count / 64 / 2048;
+    int64_t threadnum = element_count / 64 / CHACHA20_MAX_BLOCKS_PER_CALL;
 
     uint32_t maxValue = 4096;
-
-    // bool exists = std::find(intVector.begin(), intVector.end(), data_size) != intVector.end();
 
     if (!enc_stream) {
         enc_stream = c10_npu::getCurrentNPUStream().stream();
@@ -646,9 +645,9 @@ void chacha20_encrypt_do_batch(
         at::Tensor state = at::rand({64}, key_stream.options());
         void* state_ptr = state.data_ptr();
         at_npu::native::OpCommand cmd;
-        cmd.Name("chacha20_encrypt_generate_mask");
+        cmd.Name("chacha20_naive_generate_mask");
         cmd.SetCustomHandler([threadnum, state_ptr, base_ptr, element_count]() -> int {
-            chacha20_encrypt_generate_mask_impl(threadnum, enc_stream, state_ptr, base_ptr, element_count);
+            chacha20_naive_generate_mask_impl(threadnum, enc_stream, state_ptr, base_ptr, element_count);
             return 0;
         });
         cmd.Run();
@@ -658,11 +657,11 @@ void chacha20_encrypt_do_batch(
     void* key_stream_ptr = base_ptr + current_pos;
     if (data_size > 1) {
         at_npu::native::OpCommand cmd;
-        cmd.Name("chacha20_encrypt_do_batch");
+        cmd.Name("xor_do_batch");
         void* input_ptr_ = (void*)input_ptr;
         void* output_ptr_ = (void*)output_ptr;
         cmd.SetCustomHandler([key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
-            chacha20_encrypt_do_batch_impl(enc_stream, key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue);
+            xor_do_batch_impl(enc_stream, key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue);
             return 0;
         });
         cmd.Run();
@@ -675,7 +674,7 @@ void chacha20_encrypt_do_batch(
     return;
 }
 
-void chacha20_encrypt_do_unalign(
+void chacha20_naive_encrypt_do_unalign(
     at::Tensor &key_stream, 
     at::Tensor &input, 
     at::Tensor &output,
@@ -691,12 +690,10 @@ void chacha20_encrypt_do_unalign(
     char* output_ptr = (char*)output.data_ptr();
     uint8_t* base_ptr = reinterpret_cast<uint8_t*>(key_stream.data_ptr());
     int64_t data_size = input.nbytes();
-    int64_t threadnum = element_count / 64 / 2048;
+    int64_t threadnum = element_count / 64 / CHACHA20_MAX_BLOCKS_PER_CALL;
     uint32_t localSizePadding = (data_size / tp_size + 31) / 32 * 32;
 
     uint32_t maxValue = 4096;
-
-    // bool exists = std::find(intVector.begin(), intVector.end(), data_size) != intVector.end();
 
     if (!enc_stream) {
         enc_stream = c10_npu::getCurrentNPUStream().stream();
@@ -706,9 +703,9 @@ void chacha20_encrypt_do_unalign(
         at::Tensor state = at::rand({64}, key_stream.options());
         void* state_ptr = state.data_ptr();
         at_npu::native::OpCommand cmd;
-        cmd.Name("chacha20_encrypt_generate_mask");
+        cmd.Name("chacha20_naive_generate_mask");
         cmd.SetCustomHandler([threadnum, state_ptr, base_ptr, element_count]() -> int {
-            chacha20_encrypt_generate_mask_impl(threadnum, enc_stream, state_ptr, base_ptr, element_count);
+            chacha20_naive_generate_mask_impl(threadnum, enc_stream, state_ptr, base_ptr, element_count);
             return 0;
         });
         cmd.Run();
@@ -718,11 +715,11 @@ void chacha20_encrypt_do_unalign(
     void* key_stream_ptr = base_ptr + current_pos_unalign;
     for (int i = 0; i < tp_size; i++) {
         at_npu::native::OpCommand cmd;
-        cmd.Name("chacha20_encrypt_do");
+        cmd.Name("xor_do_unalign");
         void* input_ptr_ = (void*)(input_ptr + i * (data_size / tp_size));
         void* output_ptr_ = (void*)(output_ptr + i * (data_size / tp_size));
         cmd.SetCustomHandler([key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
-            chacha20_encrypt_do_unalign_impl(enc_stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
+            xor_do_unalign_impl(enc_stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
             return 0;
         });
         cmd.Run();
@@ -735,7 +732,123 @@ void chacha20_encrypt_do_unalign(
     return;
 }
 
-void aes_ctr_encrypt_do_batch(
+void chacha20_naive_encrypt_do_send(
+    at::Tensor &key_stream, 
+    at::Tensor &input, 
+    at::Tensor &output,
+    int64_t element_count,
+    bool is_enc,
+    int64_t tp_size = 1
+){
+    if (current_pos_send ==  -1) {
+        current_pos_send = element_count;
+    }
+
+    char* input_ptr = (char*)input.data_ptr();
+    char* output_ptr = (char*)output.data_ptr();
+    uint8_t* base_ptr = reinterpret_cast<uint8_t*>(key_stream.data_ptr());
+    int64_t data_size = input.nbytes();
+    int64_t threadnum = element_count / 64 / CHACHA20_MAX_BLOCKS_PER_CALL;
+    uint32_t localSizePadding = (data_size / tp_size + 31) / 32 * 32;
+
+    uint32_t maxValue = 4096;
+
+    // bool exists = std::find(intVector.begin(), intVector.end(), data_size) != intVector.end();
+
+    if (!enc_stream) {
+        enc_stream = c10_npu::getCurrentNPUStream().stream();
+    }
+
+    if (current_pos_send + localSizePadding > element_count) {
+        at::Tensor state = at::rand({64}, key_stream.options());
+        void* state_ptr = state.data_ptr();
+        at_npu::native::OpCommand cmd;
+        cmd.Name("chacha20_naive_generate_mask");
+        cmd.SetCustomHandler([threadnum, state_ptr, base_ptr, element_count]() -> int {
+            chacha20_naive_generate_mask_impl(threadnum, enc_stream, state_ptr, base_ptr, element_count);
+            return 0;
+        });
+        cmd.Run();
+        current_pos_send = 0;
+    }
+
+    void* key_stream_ptr = base_ptr + current_pos_send;
+    for (int i = 0; i < tp_size; i++) {
+        at_npu::native::OpCommand cmd;
+        cmd.Name("xor_do_unalign");
+        void* input_ptr_ = (void*)(input_ptr + i * (data_size / tp_size));
+        void* output_ptr_ = (void*)(output_ptr + i * (data_size / tp_size));
+        cmd.SetCustomHandler([key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
+            xor_do_unalign_impl(enc_stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
+            return 0;
+        });
+        cmd.Run();
+    }
+
+    current_pos_send += localSizePadding;
+
+    return;
+}
+
+void chacha20_naive_encrypt_do_recv(
+    at::Tensor &key_stream, 
+    at::Tensor &input, 
+    at::Tensor &output,
+    int64_t element_count,
+    bool is_enc,
+    int64_t tp_size = 1
+){
+    if (current_pos_recv ==  -1) {
+        current_pos_recv = element_count;
+    }
+
+    char* input_ptr = (char*)input.data_ptr();
+    char* output_ptr = (char*)output.data_ptr();
+    uint8_t* base_ptr = reinterpret_cast<uint8_t*>(key_stream.data_ptr());
+    int64_t data_size = input.nbytes();
+    int64_t threadnum = element_count / 64 / CHACHA20_MAX_BLOCKS_PER_CALL;
+    uint32_t localSizePadding = (data_size / tp_size + 31) / 32 * 32;
+
+    uint32_t maxValue = 4096;
+
+    // bool exists = std::find(intVector.begin(), intVector.end(), data_size) != intVector.end();
+
+    if (!enc_stream) {
+        enc_stream = c10_npu::getCurrentNPUStream().stream();
+    }
+
+    if (current_pos_recv + localSizePadding > element_count) {
+        at::Tensor state = at::rand({64}, key_stream.options());
+        void* state_ptr = state.data_ptr();
+        at_npu::native::OpCommand cmd;
+        cmd.Name("chacha20_naive_generate_mask");
+        cmd.SetCustomHandler([threadnum, state_ptr, base_ptr, element_count]() -> int {
+            chacha20_naive_generate_mask_impl(threadnum, enc_stream, state_ptr, base_ptr, element_count);
+            return 0;
+        });
+        cmd.Run();
+        current_pos_recv = 0;
+    }
+
+    void* key_stream_ptr = base_ptr + current_pos_recv;
+    for (int i = 0; i < tp_size; i++) {
+        at_npu::native::OpCommand cmd;
+        cmd.Name("xor_do_unalign");
+        void* input_ptr_ = (void*)(input_ptr + i * (data_size / tp_size));
+        void* output_ptr_ = (void*)(output_ptr + i * (data_size / tp_size));
+        cmd.SetCustomHandler([key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
+            xor_do_unalign_impl(enc_stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
+            return 0;
+        });
+        cmd.Run();
+    }
+
+    current_pos_recv += localSizePadding;
+
+    return;
+}
+
+void aes_naive_encrypt_do_batch(
     at::Tensor &key_stream, 
     at::Tensor &input, 
     at::Tensor &output,
@@ -751,7 +864,6 @@ void aes_ctr_encrypt_do_batch(
     char* output_ptr = (char*)output.data_ptr();
     uint8_t* base_ptr = reinterpret_cast<uint8_t*>(key_stream.data_ptr());
     int64_t data_size = input.nbytes();
-    int64_t threadnum = element_count / 64 / 2048;
 
     uint32_t maxValue = 4096;
 
@@ -764,7 +876,7 @@ void aes_ctr_encrypt_do_batch(
     if (current_pos + data_size / tp_size > element_count) {
         printf("generating key stream...\n");
         uint32_t totalBlocks = static_cast<uint32_t>((element_count + AES_BLOCK_SIZE - 1) / AES_BLOCK_SIZE);
-        uint32_t kernelBlocks = (totalBlocks + MAX_BLOCKS_PER_CALL - 1) / MAX_BLOCKS_PER_CALL;
+        uint32_t kernelBlocks = (totalBlocks + AES_MAX_BLOCKS_PER_CALL - 1) / AES_MAX_BLOCKS_PER_CALL;
 
         uint8_t rk176[AES128_RK_BYTES];
         expandKey128(key, rk176);
@@ -775,9 +887,9 @@ void aes_ctr_encrypt_do_batch(
         aclrtMemcpy(deviceRoundKeys, AES128_RK_PAD_BYTES, rk192, AES128_RK_PAD_BYTES, ACL_MEMCPY_HOST_TO_DEVICE);
 
         at_npu::native::OpCommand cmd;
-        cmd.Name("aes_ctr_encrypt_generate_mask");
+        cmd.Name("aes_naive_generate_mask");
         cmd.SetCustomHandler([kernelBlocks, deviceRoundKeys, base_ptr, element_count]() -> int {
-            aes128_ecb_encrypt_do_impl(kernelBlocks, enc_stream, deviceRoundKeys, base_ptr, base_ptr, static_cast<uint32_t>(element_count));
+            aes_naive_generate_mask_impl(kernelBlocks, enc_stream, deviceRoundKeys, base_ptr, base_ptr, static_cast<uint32_t>(element_count));
             return 0;
         });
         cmd.Run();
@@ -793,7 +905,7 @@ void aes_ctr_encrypt_do_batch(
         void* input_ptr_ = (void*)input_ptr;
         void* output_ptr_ = (void*)output_ptr;
         cmd.SetCustomHandler([key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
-            chacha20_encrypt_do_batch_impl(enc_stream, key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue);
+            xor_do_batch_impl(enc_stream, key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue);
             return 0;
         });
         cmd.Run();
@@ -806,7 +918,7 @@ void aes_ctr_encrypt_do_batch(
     return;
 }
 
-void aes_ctr_encrypt_do(
+void aes_naive_encrypt_do(
     at::Tensor &key_stream,
     at::Tensor &input,
     at::Tensor &output,
@@ -822,7 +934,6 @@ void aes_ctr_encrypt_do(
     char* output_ptr = (char*)output.data_ptr();
     uint8_t* base_ptr = reinterpret_cast<uint8_t*>(key_stream.data_ptr());
     int64_t data_size = input.nbytes();
-    int64_t threadnum = element_count / 64 / 2048;
 
     uint32_t maxValue = 4096;
 
@@ -835,7 +946,7 @@ void aes_ctr_encrypt_do(
     if (current_pos + data_size / tp_size > element_count) {
         printf("generating key stream...\n");
         uint32_t totalBlocks = static_cast<uint32_t>((element_count + AES_BLOCK_SIZE - 1) / AES_BLOCK_SIZE);
-        uint32_t kernelBlocks = (totalBlocks + MAX_BLOCKS_PER_CALL - 1) / MAX_BLOCKS_PER_CALL;
+        uint32_t kernelBlocks = (totalBlocks + AES_MAX_BLOCKS_PER_CALL - 1) / AES_MAX_BLOCKS_PER_CALL;
 
         uint8_t rk176[AES128_RK_BYTES];
         expandKey128(key, rk176);
@@ -846,9 +957,9 @@ void aes_ctr_encrypt_do(
         aclrtMemcpy(deviceRoundKeys, AES128_RK_PAD_BYTES, rk192, AES128_RK_PAD_BYTES, ACL_MEMCPY_HOST_TO_DEVICE);
 
         at_npu::native::OpCommand cmd;
-        cmd.Name("aes_ctr_encrypt_generate_mask");
+        cmd.Name("aes_naive_generate_mask");
         cmd.SetCustomHandler([kernelBlocks, deviceRoundKeys, base_ptr, element_count]() -> int {
-            aes128_ecb_encrypt_do_impl(kernelBlocks, enc_stream, deviceRoundKeys, base_ptr, base_ptr, static_cast<uint32_t>(element_count));
+            aes_naive_generate_mask_impl(kernelBlocks, enc_stream, deviceRoundKeys, base_ptr, base_ptr, static_cast<uint32_t>(element_count));
             return 0;
         });
         cmd.Run();
@@ -864,7 +975,7 @@ void aes_ctr_encrypt_do(
         void* input_ptr_ = (void*)(input_ptr + i * (data_size / tp_size));
         void* output_ptr_ = (void*)(output_ptr + i * (data_size / tp_size));
         cmd.SetCustomHandler([key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
-            chacha20_encrypt_do_impl(enc_stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
+            xor_do_impl(enc_stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
             return 0;
         });
         cmd.Run();
@@ -877,7 +988,7 @@ void aes_ctr_encrypt_do(
     return;
 }
 
-void aes_ctr_encrypt_do_unalign(
+void aes_naive_encrypt_do_unalign(
     at::Tensor &key_stream, 
     at::Tensor &input, 
     at::Tensor &output,
@@ -893,7 +1004,6 @@ void aes_ctr_encrypt_do_unalign(
     char* output_ptr = (char*)output.data_ptr();
     uint8_t* base_ptr = reinterpret_cast<uint8_t*>(key_stream.data_ptr());
     int64_t data_size = input.nbytes();
-    int64_t threadnum = element_count / 64 / 2048;
     uint32_t localSizePadding = (data_size / tp_size + 31) / 32 * 32;
 
     uint32_t maxValue = 4096;
@@ -906,7 +1016,7 @@ void aes_ctr_encrypt_do_unalign(
 
     if (current_pos_unalign + localSizePadding > element_count) {
         uint32_t totalBlocks = static_cast<uint32_t>((element_count + AES_BLOCK_SIZE - 1) / AES_BLOCK_SIZE);
-        uint32_t kernelBlocks = (totalBlocks + MAX_BLOCKS_PER_CALL - 1) / MAX_BLOCKS_PER_CALL;
+        uint32_t kernelBlocks = (totalBlocks + AES_MAX_BLOCKS_PER_CALL - 1) / AES_MAX_BLOCKS_PER_CALL;
 
         uint8_t rk176[AES128_RK_BYTES];
         expandKey128(key, rk176);
@@ -917,9 +1027,9 @@ void aes_ctr_encrypt_do_unalign(
         aclrtMemcpy(deviceRoundKeys, AES128_RK_PAD_BYTES, rk192, AES128_RK_PAD_BYTES, ACL_MEMCPY_HOST_TO_DEVICE);
 
         at_npu::native::OpCommand cmd;
-        cmd.Name("aes_ctr_encrypt_generate_mask");
+        cmd.Name("aes_naive_generate_mask");
         cmd.SetCustomHandler([kernelBlocks, deviceRoundKeys, base_ptr, element_count]() -> int {
-            aes128_ecb_encrypt_do_impl(kernelBlocks, enc_stream, deviceRoundKeys, base_ptr, base_ptr, static_cast<uint32_t>(element_count));
+            aes_naive_generate_mask_impl(kernelBlocks, enc_stream, deviceRoundKeys, base_ptr, base_ptr, static_cast<uint32_t>(element_count));
             return 0;
         });
         cmd.Run();
@@ -929,11 +1039,11 @@ void aes_ctr_encrypt_do_unalign(
     void* key_stream_ptr = base_ptr + current_pos_unalign;
     for (int i = 0; i < tp_size; i++) {
         at_npu::native::OpCommand cmd;
-        cmd.Name("chacha20_encrypt_do");
+        cmd.Name("xor_do_unalign");
         void* input_ptr_ = (void*)(input_ptr + i * (data_size / tp_size));
         void* output_ptr_ = (void*)(output_ptr + i * (data_size / tp_size));
         cmd.SetCustomHandler([key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
-            chacha20_encrypt_do_unalign_impl(enc_stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
+            xor_do_unalign_impl(enc_stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
             return 0;
         });
         cmd.Run();
@@ -942,6 +1052,138 @@ void aes_ctr_encrypt_do_unalign(
     if (!is_enc) {
         current_pos_unalign += localSizePadding;
     }
+
+    return;
+}
+
+void aes_naive_encrypt_do_send(
+    at::Tensor &key_stream, 
+    at::Tensor &input, 
+    at::Tensor &output,
+    int64_t element_count,
+    bool is_enc,
+    int64_t tp_size = 1
+){
+    if (current_pos_send ==  -1) {
+        current_pos_send = element_count;
+    }
+
+    char* input_ptr = (char*)input.data_ptr();
+    char* output_ptr = (char*)output.data_ptr();
+    uint8_t* base_ptr = reinterpret_cast<uint8_t*>(key_stream.data_ptr());
+    int64_t data_size = input.nbytes();
+    uint32_t localSizePadding = (data_size / tp_size + 31) / 32 * 32;
+
+    uint32_t maxValue = 4096;
+
+    // bool exists = std::find(intVector.begin(), intVector.end(), data_size) != intVector.end();
+
+    if (!enc_stream) {
+        enc_stream = c10_npu::getCurrentNPUStream().stream();
+    }
+
+    if (current_pos_send + localSizePadding > element_count) {
+        uint32_t totalBlocks = static_cast<uint32_t>((element_count + AES_BLOCK_SIZE - 1) / AES_BLOCK_SIZE);
+        uint32_t kernelBlocks = (totalBlocks + AES_MAX_BLOCKS_PER_CALL - 1) / AES_MAX_BLOCKS_PER_CALL;
+
+        uint8_t rk176[AES128_RK_BYTES];
+        expandKey128(key, rk176);
+        uint8_t rk192[AES128_RK_PAD_BYTES];
+        padRoundKeys192(rk176, rk192);
+        void* deviceRoundKeys = nullptr;
+        aclrtMalloc(&deviceRoundKeys, AES128_RK_PAD_BYTES, ACL_MEM_MALLOC_HUGE_FIRST);
+        aclrtMemcpy(deviceRoundKeys, AES128_RK_PAD_BYTES, rk192, AES128_RK_PAD_BYTES, ACL_MEMCPY_HOST_TO_DEVICE);
+
+        at_npu::native::OpCommand cmd;
+        cmd.Name("aes_naive_generate_mask");
+        cmd.SetCustomHandler([kernelBlocks, deviceRoundKeys, base_ptr, element_count]() -> int {
+            aes_naive_generate_mask_impl(kernelBlocks, enc_stream, deviceRoundKeys, base_ptr, base_ptr, static_cast<uint32_t>(element_count));
+            return 0;
+        });
+        cmd.Run();
+        current_pos_send = 0;
+    }
+
+    void* key_stream_ptr = base_ptr + current_pos_send;
+    for (int i = 0; i < tp_size; i++) {
+        at_npu::native::OpCommand cmd;
+        cmd.Name("xor_do_unalign");
+        void* input_ptr_ = (void*)(input_ptr + i * (data_size / tp_size));
+        void* output_ptr_ = (void*)(output_ptr + i * (data_size / tp_size));
+        cmd.SetCustomHandler([key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
+            xor_do_unalign_impl(enc_stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
+            return 0;
+        });
+        cmd.Run();
+    }
+
+    current_pos_send += localSizePadding;
+
+    return;
+}
+
+void aes_naive_encrypt_do_recv(
+    at::Tensor &key_stream, 
+    at::Tensor &input, 
+    at::Tensor &output,
+    int64_t element_count,
+    bool is_enc,
+    int64_t tp_size = 1
+){
+    if (current_pos_recv ==  -1) {
+        current_pos_recv = element_count;
+    }
+
+    char* input_ptr = (char*)input.data_ptr();
+    char* output_ptr = (char*)output.data_ptr();
+    uint8_t* base_ptr = reinterpret_cast<uint8_t*>(key_stream.data_ptr());
+    int64_t data_size = input.nbytes();
+    uint32_t localSizePadding = (data_size / tp_size + 31) / 32 * 32;
+
+    uint32_t maxValue = 4096;
+
+    // bool exists = std::find(intVector.begin(), intVector.end(), data_size) != intVector.end();
+
+    if (!enc_stream) {
+        enc_stream = c10_npu::getCurrentNPUStream().stream();
+    }
+
+    if (current_pos_recv + localSizePadding > element_count) {
+        uint32_t totalBlocks = static_cast<uint32_t>((element_count + AES_BLOCK_SIZE - 1) / AES_BLOCK_SIZE);
+        uint32_t kernelBlocks = (totalBlocks + AES_MAX_BLOCKS_PER_CALL - 1) / AES_MAX_BLOCKS_PER_CALL;
+
+        uint8_t rk176[AES128_RK_BYTES];
+        expandKey128(key, rk176);
+        uint8_t rk192[AES128_RK_PAD_BYTES];
+        padRoundKeys192(rk176, rk192);
+        void* deviceRoundKeys = nullptr;
+        aclrtMalloc(&deviceRoundKeys, AES128_RK_PAD_BYTES, ACL_MEM_MALLOC_HUGE_FIRST);
+        aclrtMemcpy(deviceRoundKeys, AES128_RK_PAD_BYTES, rk192, AES128_RK_PAD_BYTES, ACL_MEMCPY_HOST_TO_DEVICE);
+
+        at_npu::native::OpCommand cmd;
+        cmd.Name("aes_naive_generate_mask");
+        cmd.SetCustomHandler([kernelBlocks, deviceRoundKeys, base_ptr, element_count]() -> int {
+            aes_naive_generate_mask_impl(kernelBlocks, enc_stream, deviceRoundKeys, base_ptr, base_ptr, static_cast<uint32_t>(element_count));
+            return 0;
+        });
+        cmd.Run();
+        current_pos_recv = 0;
+    }
+
+    void* key_stream_ptr = base_ptr + current_pos_recv;
+    for (int i = 0; i < tp_size; i++) {
+        at_npu::native::OpCommand cmd;
+        cmd.Name("xor_do_unalign");
+        void* input_ptr_ = (void*)(input_ptr + i * (data_size / tp_size));
+        void* output_ptr_ = (void*)(output_ptr + i * (data_size / tp_size));
+        cmd.SetCustomHandler([key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
+            xor_do_unalign_impl(enc_stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
+            return 0;
+        });
+        cmd.Run();
+    }
+
+    current_pos_recv += localSizePadding;
 
     return;
 }
@@ -1001,26 +1243,42 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.impl("mla_preprocess", torch::kPrivateUse1, &vllm_ascend::mla_preprocess);
 
     ops.def(
-        "chacha20_encrypt_do(Tensor! keystream, Tensor! input, Tensor! output, int element_count, bool is_enc, int tp_size) -> ()");
-    ops.impl("chacha20_encrypt_do", torch::kPrivateUse1, &vllm_ascend::chacha20_encrypt_do);
+        "chacha20_naive_encrypt_do(Tensor! keystream, Tensor! input, Tensor! output, int element_count, bool is_enc, int tp_size) -> ()");
+    ops.impl("chacha20_naive_encrypt_do", torch::kPrivateUse1, &vllm_ascend::chacha20_naive_encrypt_do);
 
     ops.def(
-        "chacha20_encrypt_do_batch(Tensor! keystream, Tensor! input, Tensor! output, int element_count, bool is_enc, int tp_size) -> ()");
-    ops.impl("chacha20_encrypt_do_batch", torch::kPrivateUse1, &vllm_ascend::chacha20_encrypt_do_batch);
+        "chacha20_naive_encrypt_do_batch(Tensor! keystream, Tensor! input, Tensor! output, int element_count, bool is_enc, int tp_size) -> ()");
+    ops.impl("chacha20_naive_encrypt_do_batch", torch::kPrivateUse1, &vllm_ascend::chacha20_naive_encrypt_do_batch);
 
     ops.def(
-        "chacha20_encrypt_do_unalign(Tensor! keystream, Tensor! input, Tensor! output, int element_count, bool is_enc, int tp_size) -> ()");
-    ops.impl("chacha20_encrypt_do_unalign", torch::kPrivateUse1, &vllm_ascend::chacha20_encrypt_do_unalign);
+        "chacha20_naive_encrypt_do_unalign(Tensor! keystream, Tensor! input, Tensor! output, int element_count, bool is_enc, int tp_size) -> ()");
+    ops.impl("chacha20_naive_encrypt_do_unalign", torch::kPrivateUse1, &vllm_ascend::chacha20_naive_encrypt_do_unalign);
 
     ops.def(
-        "aes_ctr_encrypt_do_batch(Tensor! keystream, Tensor! input, Tensor! output, int element_count, bool is_enc, int tp_size) -> ()");
-    ops.impl("aes_ctr_encrypt_do_batch", torch::kPrivateUse1, &vllm_ascend::aes_ctr_encrypt_do_batch);
+        "chacha20_naive_encrypt_do_send(Tensor! keystream, Tensor! input, Tensor! output, int element_count, bool is_enc, int tp_size) -> ()");
+    ops.impl("chacha20_naive_encrypt_do_send", torch::kPrivateUse1, &vllm_ascend::chacha20_naive_encrypt_do_send);
 
     ops.def(
-        "aes_ctr_encrypt_do(Tensor! keystream, Tensor! input, Tensor! output, int element_count, bool is_enc, int tp_size) -> ()");
-    ops.impl("aes_ctr_encrypt_do", torch::kPrivateUse1, &vllm_ascend::aes_ctr_encrypt_do);
+        "chacha20_naive_encrypt_do_recv(Tensor! keystream, Tensor! input, Tensor! output, int element_count, bool is_enc, int tp_size) -> ()");
+    ops.impl("chacha20_naive_encrypt_do_recv", torch::kPrivateUse1, &vllm_ascend::chacha20_naive_encrypt_do_recv);
 
     ops.def(
-        "aes_ctr_encrypt_do_unalign(Tensor! keystream, Tensor! input, Tensor! output, int element_count, bool is_enc, int tp_size) -> ()");
-    ops.impl("aes_ctr_encrypt_do_unalign", torch::kPrivateUse1, &vllm_ascend::aes_ctr_encrypt_do_unalign);
+        "aes_naive_encrypt_do_batch(Tensor! keystream, Tensor! input, Tensor! output, int element_count, bool is_enc, int tp_size) -> ()");
+    ops.impl("aes_naive_encrypt_do_batch", torch::kPrivateUse1, &vllm_ascend::aes_naive_encrypt_do_batch);
+
+    ops.def(
+        "aes_naive_encrypt_do(Tensor! keystream, Tensor! input, Tensor! output, int element_count, bool is_enc, int tp_size) -> ()");
+    ops.impl("aes_naive_encrypt_do", torch::kPrivateUse1, &vllm_ascend::aes_naive_encrypt_do);
+
+    ops.def(
+        "aes_naive_encrypt_do_unalign(Tensor! keystream, Tensor! input, Tensor! output, int element_count, bool is_enc, int tp_size) -> ()");
+    ops.impl("aes_naive_encrypt_do_unalign", torch::kPrivateUse1, &vllm_ascend::aes_naive_encrypt_do_unalign);
+
+    ops.def(
+        "aes_naive_encrypt_do_send(Tensor! keystream, Tensor! input, Tensor! output, int element_count, bool is_enc, int tp_size) -> ()");
+    ops.impl("aes_naive_encrypt_do_send", torch::kPrivateUse1, &vllm_ascend::aes_naive_encrypt_do_send);
+
+    ops.def(
+        "aes_naive_encrypt_do_recv(Tensor! keystream, Tensor! input, Tensor! output, int element_count, bool is_enc, int tp_size) -> ()");
+    ops.impl("aes_naive_encrypt_do_recv", torch::kPrivateUse1, &vllm_ascend::aes_naive_encrypt_do_recv);
 }
