@@ -198,4 +198,12 @@ namespace vllm_ascend {
         void* input,
         void* output,
         uint32_t dataSize);
+
+    extern void aes_vec_generate_mask_impl(
+        uint32_t blockDim,
+        void* stream,
+        void* roundKeysPadded192,
+        void* input,
+        void* output,
+        uint32_t dataSize);
 }

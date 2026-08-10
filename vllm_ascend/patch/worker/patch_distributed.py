@@ -33,7 +33,9 @@ from vllm_ascend.utils import create_hccl_pg_options
 
 CHACHA20_NAIVE = "chacha20-naive"
 AES_NAIVE = "aes-naive"
-SUPPORTED_ENCRYPTION_ALGORITHMS = (CHACHA20_NAIVE, AES_NAIVE)
+AES_VEC = "aes-vec"
+SUPPORTED_ENCRYPTION_ALGORITHMS = (CHACHA20_NAIVE, AES_NAIVE,
+                                   AES_VEC)
 
 
 @lru_cache(maxsize=1)
@@ -191,6 +193,10 @@ class GroupCoordinatorPatch(GroupCoordinator):
             torch.ops._C_ascend.aes_naive_encrypt_do(
                 self.key_stream_for_align, input_, output,
                 self.pool_size_collective, is_encrypt, tp_size)
+        elif self.encryption_algorithm == AES_VEC:
+            torch.ops._C_ascend.aes_vec_encrypt_do(
+                self.key_stream_for_align, input_, output,
+                self.pool_size_collective, is_encrypt, tp_size)
 
     def _crypt_batch(self,
                      input_: torch.Tensor,
@@ -207,6 +213,10 @@ class GroupCoordinatorPatch(GroupCoordinator):
                 self.pool_size_collective, is_encrypt, tp_size)
         elif self.encryption_algorithm == AES_NAIVE:
             torch.ops._C_ascend.aes_naive_encrypt_do_batch(
+                self.key_stream_for_align, input_, output,
+                self.pool_size_collective, is_encrypt, tp_size)
+        elif self.encryption_algorithm == AES_VEC:
+            torch.ops._C_ascend.aes_vec_encrypt_do_batch(
                 self.key_stream_for_align, input_, output,
                 self.pool_size_collective, is_encrypt, tp_size)
 
@@ -227,6 +237,10 @@ class GroupCoordinatorPatch(GroupCoordinator):
             torch.ops._C_ascend.aes_naive_encrypt_do_unalign(
                 self.key_stream_for_unalign, input_, output,
                 self.pool_size_collective, is_encrypt, tp_size)
+        elif self.encryption_algorithm == AES_VEC:
+            torch.ops._C_ascend.aes_vec_encrypt_do_unalign(
+                self.key_stream_for_unalign, input_, output,
+                self.pool_size_collective, is_encrypt, tp_size)
 
     def _crypt_send(self,
                     input_: torch.Tensor,
@@ -245,6 +259,10 @@ class GroupCoordinatorPatch(GroupCoordinator):
             torch.ops._C_ascend.aes_naive_encrypt_do_send(
                 self.key_stream_for_send, input_, output,
                 self.pool_size_p2p, is_encrypt, tp_size)
+        elif self.encryption_algorithm == AES_VEC:
+            torch.ops._C_ascend.aes_vec_encrypt_do_send(
+                self.key_stream_for_send, input_, output,
+                self.pool_size_p2p, is_encrypt, tp_size)
 
     def _crypt_recv(self,
                     input_: torch.Tensor,
@@ -261,6 +279,10 @@ class GroupCoordinatorPatch(GroupCoordinator):
                 self.pool_size_p2p, is_encrypt, tp_size)
         elif self.encryption_algorithm == AES_NAIVE:
             torch.ops._C_ascend.aes_naive_encrypt_do_recv(
+                self.key_stream_for_recv, input_, output,
+                self.pool_size_p2p, is_encrypt, tp_size)
+        elif self.encryption_algorithm == AES_VEC:
+            torch.ops._C_ascend.aes_vec_encrypt_do_recv(
                 self.key_stream_for_recv, input_, output,
                 self.pool_size_p2p, is_encrypt, tp_size)
     
