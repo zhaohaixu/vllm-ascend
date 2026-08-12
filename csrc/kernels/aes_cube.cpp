@@ -1,5 +1,10 @@
 #include "kernel_operator.h"
+
+#define ASCENDC_CUBE_ONLY
+#include "lib/matmul_intf.h"
+
 using namespace AscendC;
+using namespace matmul;
 
 // S-box (for final round)
 static const uint8_t AES_SBOX[256] = {
@@ -20,6 +25,7 @@ static const uint8_t AES_SBOX[256] = {
     0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
     0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16};
 
+// T-tables (Te0..Te3), 32-bit packed values
 static const uint32_t Te0[256] = {
     0xa56363c6U, 0x847c7cf8U, 0x997777eeU, 0x8d7b7bf6U,
     0x0df2f2ffU, 0xbd6b6bd6U, 0xb16f6fdeU, 0x54c5c591U,
@@ -286,12 +292,38 @@ static const uint32_t Te3[256] = {
 
 constexpr int AES_BLOCK_SIZE = 16;
 constexpr int AES128_NR = 10;
-constexpr int AES128_RK_PAD_WORDS = 48; // 48 uint32_t words = 192B, 包含 44 个 round key + 4 个Padded word
-constexpr int VEC_BLOCKS = 32 * 8;      // 一次并行 blocks 数
-constexpr int CORECOUNT = 32;
-constexpr uint32_t MAX_BLOCKS_PER_CALL = VEC_BLOCKS;
+constexpr int AES128_RK_BYTES = 16 * (AES128_NR + 1); // 176
+constexpr int AES128_RK_PAD_WORDS = 48;               // 176B padded to 192B (32B aligned)
+constexpr int VEC_BLOCKS = 32;                        // 一次并行 blocks 数
+constexpr uint32_t MAX_BLOCKS_PER_CALL = 32;
+constexpr int WORKSPACE_B_SIZE = VEC_BLOCKS * 4 * 256;
+constexpr int WORKSPACE_C_SIZE = 16 * VEC_BLOCKS * 4;
+constexpr uint32_t MM_LOCAL_WORKSPACE_SIZE = 64 * 1024;
 
-class KernelAESVec
+constexpr uint32_t CUBE_M = 16;
+constexpr uint32_t CUBE_N = VEC_BLOCKS * 4; // 128
+constexpr uint32_t CUBE_K = 256;
+constexpr uint32_t CUBE_C_ELEMS = CUBE_M * CUBE_N; // 2048 int32
+
+constexpr uint32_t ONEHOT_ROW_BYTES = 256;
+
+constexpr uint16_t FLAG_B_READY = 8; // B矩阵已经写好
+constexpr uint16_t FLAG_C_READY = 9; // C矩阵已经计算好
+
+// 把 host 传进来的 tilingDevice 从 GM 读到 kernel 本地的 tiling 变量中
+__aicore__ inline void CopyTiling(TCubeTiling *tiling, GM_ADDR tilingGM)
+{
+    uint32_t *ptr = reinterpret_cast<uint32_t *>(tiling);
+    auto tiling32 = reinterpret_cast<__gm__ uint32_t *>(tilingGM);
+
+    for (uint32_t i = 0; i < sizeof(TCubeTiling) / sizeof(uint32_t); i++, ptr++)
+    {
+        *ptr = *(tiling32 + i);
+    }
+    return;
+}
+
+class KernelAESCube
 {
 public:
     LocalTensor<uint32_t> te0LT;
@@ -300,128 +332,334 @@ public:
     LocalTensor<uint32_t> te3LT;
     LocalTensor<uint32_t> AESLT;
 
-    __aicore__ inline KernelAESVec() {}
+    __aicore__ inline KernelAESCube() {}
 
     __aicore__ inline void Init(__gm__ uint32_t *rk48,
                                 __gm__ uint8_t *in,
                                 __gm__ uint8_t *out,
-                                uint32_t nounce1,
-                                uint32_t nounce2,
-                                uint32_t nounce3,
+                                __gm__ uint8_t *te0,
+                                __gm__ uint8_t *te1,
+                                __gm__ uint8_t *te2,
+                                __gm__ uint8_t *te3,
+                                __gm__ uint8_t *sbox,
+                                __gm__ int8_t *b_workspace,
+                                __gm__ int32_t *c_workspace,
+                                __gm__ uint8_t *workspace,
+                                __gm__ uint8_t *tilingGm,
+                                uint32_t nounce,
                                 uint32_t dataSize)
     {
+        uint32_t blockId = GetBlockIdx();
+
+        CopyTiling(&tiling, tilingGm);
+
         rkGlobal.SetGlobalBuffer((__gm__ uint32_t *)rk48);
         inGlobal.SetGlobalBuffer((__gm__ uint8_t *)in);
         outGlobal.SetGlobalBuffer((__gm__ uint8_t *)out);
 
-        this->nounce1 = nounce1;
-        this->nounce2 = nounce2;
-        this->nounce3 = nounce3;
+        te0Global.SetGlobalBuffer((__gm__ int8_t *)te0);
+        te1Global.SetGlobalBuffer((__gm__ int8_t *)te1);
+        te2Global.SetGlobalBuffer((__gm__ int8_t *)te2);
+        te3Global.SetGlobalBuffer((__gm__ int8_t *)te3);
+        sboxGlobal.SetGlobalBuffer((__gm__ int8_t *)sbox);
+
+        b_workspaceGlobal.SetGlobalBuffer(
+            (__gm__ int8_t *)b_workspace + blockId * WORKSPACE_B_SIZE);
+
+        c_workspaceGlobal.SetGlobalBuffer(
+            (__gm__ int32_t *)c_workspace + blockId * WORKSPACE_C_SIZE);
+
+        this->nounce = nounce;
         this->dataSize = dataSize;
         this->totalBlocks = (dataSize + AES_BLOCK_SIZE - 1) / AES_BLOCK_SIZE;
 
-        pipe.InitBuffer(rkWordsQ, 2, AES128_RK_PAD_WORDS * sizeof(uint32_t)); // 48 words
-        pipe.InitBuffer(inQ, 2, MAX_BLOCKS_PER_CALL * AES_BLOCK_SIZE + 64);   // bytes
-        pipe.InitBuffer(outQ, 2, MAX_BLOCKS_PER_CALL * AES_BLOCK_SIZE + 64);  // bytes
-        pipe.InitBuffer(scratchQ, 1, VEC_BLOCKS * AES_BLOCK_SIZE * 4);        // bytes        state
-        pipe.InitBuffer(xorQ, 1, VEC_BLOCKS * AES_BLOCK_SIZE * 4);            // 存放xor结果 xLocal
-        pipe.InitBuffer(rkxQ, 1, VEC_BLOCKS * AES_BLOCK_SIZE);                // rk * 8  rkAll
-        pipe.InitBuffer(teBuf, (256 * 5) * sizeof(uint32_t));
-        // pipe.InitBuffer(scatterIdxBuf, 4 * VEC_BLOCKS * sizeof(int32_t));
-
-        // LocalTensor<uint32_t> teAll = TeQ.AllocTensor<uint32_t>();
-        LocalTensor<uint32_t> teAll = teBuf.Get<uint32_t>();
-        te0LT = teAll;
-        te1LT = teAll[256 * 1];
-        te2LT = teAll[256 * 2];
-        te3LT = teAll[256 * 3];
-        AESLT = teAll[256 * 4];
-
-        for (int i = 0; i < 256; ++i)
+        if ASCEND_IS_AIC
         {
-            te0LT(i) = Te0[i];
-            te1LT(i) = Te1[i];
-            te2LT(i) = Te2[i];
-            te3LT(i) = Te3[i];
-            AESLT(i) = (uint32_t)AES_SBOX[i];
+            SetSysWorkspace(workspace);
+
+            REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm, &tiling);
+
+            pipe.InitBuffer(mmTmpBuf, MM_LOCAL_WORKSPACE_SIZE);
+
+            mm.SetLocalWorkspace(mmTmpBuf.Get<uint8_t>());
         }
-        // InitScatterOffsets();
+
+        if ASCEND_IS_AIV
+        {
+            // pipe.InitBuffer(rkBytesQ, 1, AES128_RK_PAD_BYTES);
+            pipe.InitBuffer(rkWordsQ, 1, 48 * sizeof(uint32_t));
+            pipe.InitBuffer(inQ, 1, MAX_BLOCKS_PER_CALL * AES_BLOCK_SIZE + 64);
+            pipe.InitBuffer(outQ, 1, MAX_BLOCKS_PER_CALL * AES_BLOCK_SIZE + 64);
+
+            pipe.InitBuffer(scratchQ, 1, VEC_BLOCKS * AES_BLOCK_SIZE * 4);
+            pipe.InitBuffer(xorQ, 1, VEC_BLOCKS * AES_BLOCK_SIZE * 4);
+            pipe.InitBuffer(rkxQ, 1, VEC_BLOCKS * AES_BLOCK_SIZE);
+
+            pipe.InitBuffer(teBuf, (256 * 5) * sizeof(uint32_t));
+            pipe.InitBuffer(onehotTableBuf, 256 * 256 * sizeof(uint8_t));
+            pipe.InitBuffer(B1VECBuf, 256 * VEC_BLOCKS * 4 * sizeof(uint8_t));
+
+            // AIV 侧需要把 AIC 算出的 C 拷回本地重组 state0
+            pipe.InitBuffer(cLocalBuf, CUBE_C_ELEMS * sizeof(int32_t));
+
+            LocalTensor<uint32_t> teAll = teBuf.Get<uint32_t>();
+
+            te0LT = teAll;
+            te1LT = teAll[256 * 1];
+            te2LT = teAll[256 * 2];
+            te3LT = teAll[256 * 3];
+            AESLT = teAll[256 * 4];
+
+            LocalTensor<int8_t> onehotTable = onehotTableBuf.Get<int8_t>();
+            LocalTensor<uint32_t> onehotTableU32 = onehotTable.ReinterpretCast<uint32_t>();
+            AscendC::Duplicate(onehotTableU32, static_cast<uint32_t>(0), static_cast<int32_t>((256 * 256) / sizeof(uint32_t)));
+            for (int i = 0; i < 256; ++i)
+            {
+                te0LT(i) = Te0[i];
+                te1LT(i) = Te1[i];
+                te2LT(i) = Te2[i];
+                te3LT(i) = Te3[i];
+                AESLT(i) = static_cast<uint32_t>(AES_SBOX[i]);
+                onehotTable(i * 256 + i) = static_cast<int8_t>(1);
+            }
+        }
+    }
+
+    // 使用 Matmul 高阶 API 做 Te0 查表：
+    //
+    // A = te0Global:
+    //     [16,256] int8
+    //     host 侧必须传 4096B 的 Te0 byte-plane，不是 1024B packed uint32。
+    //
+    // B = b_workspaceGlobal:
+    //     [128,256] int8
+    //     每一行是一个 one-hot。
+    //     因为 MatmulType B 的 transpose=true，所以实际参与计算的是 B^T: [256,128]。
+    //
+    // C = c_workspaceGlobal:
+    //     [16,128] int32
+    //
+    // 最终重新拼回 state0[0..127]。
+    __aicore__ inline void CubeLookupTe0ToState0(
+        LocalTensor<uint32_t> state0,
+        LocalTensor<int8_t> b1Vec,
+        LocalTensor<int32_t> cLocal)
+    {
+        AscendC::PipeBarrier<PIPE_V>();
+        // AIV0：B 从 LocalTensor 写到 GM，供 AIC Matmul 读取。
+        AscendC::DataCopy(b_workspaceGlobal, b1Vec, static_cast<uint32_t>(WORKSPACE_B_SIZE));
+
+        AscendC::PipeBarrier<PIPE_MTE3>();
+
+        // AIV0：通知 AIC，B 已经写好。
+        // AIV1 会在 ProcessAivShadow() 里同步 Set 同一个 FLAG_B_READY。
+        AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(FLAG_B_READY);
+
+        // AIV0：等待 AIC 完成 Matmul。
+        AscendC::CrossCoreWaitFlag(FLAG_C_READY);
+
+        // AIV0：C 从 GM 搬回本地。
+        AscendC::DataCopy(cLocal, c_workspaceGlobal, static_cast<uint32_t>(CUBE_C_ELEMS));
+
+        AscendC::PipeBarrier<PIPE_MTE2>();
+
+        // C 的前 4 行是 Te0 的 4 个 byte plane。
+        // 重新拼回 state0，替代原来的 Gather(state0, te0LT, ...)
+        for (uint32_t col = 0; col < CUBE_N; ++col)
+        {
+            uint32_t b0 = static_cast<uint32_t>(static_cast<uint8_t>(cLocal(0 * CUBE_N + col)));
+
+            uint32_t b1 = static_cast<uint32_t>(static_cast<uint8_t>(cLocal(1 * CUBE_N + col)));
+
+            uint32_t b2 = static_cast<uint32_t>(static_cast<uint8_t>(cLocal(2 * CUBE_N + col)));
+
+            uint32_t b3 = static_cast<uint32_t>(static_cast<uint8_t>(cLocal(3 * CUBE_N + col)));
+
+            // state0(col) = (b3 << 24) | (b2 << 16) | (b1 << 8) | b0;
+            state0(col) = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+    }
+
+    __aicore__ inline uint32_t GetCoreStart() const
+    {
+        uint32_t blockId = GetBlockIdx();
+        uint32_t blockNum = GetBlockNum();
+
+        uint32_t blocksPerCore = (totalBlocks + blockNum - 1) / blockNum;
+        return blockId * blocksPerCore;
+    }
+
+    __aicore__ inline uint32_t GetCoreEnd() const
+    {
+        uint32_t blockId = GetBlockIdx();
+        uint32_t blockNum = GetBlockNum();
+
+        uint32_t blocksPerCore = (totalBlocks + blockNum - 1) / blockNum;
+        uint32_t coreStart = blockId * blocksPerCore;
+        return min(coreStart + blocksPerCore, totalBlocks);
     }
 
     __aicore__ inline void Process()
     {
-        uint32_t blockId = GetBlockIdx();  // 当前核的编号
-        uint32_t blockNum = GetBlockNum(); // 总共启动核数
+        if ASCEND_IS_AIV
+        {
+            ProcessAivReal();
+            return;
+        }
 
-        // 先把 totalBlocks 按核均分
-        uint32_t blocksPerCore = (totalBlocks + blockNum - 1) / blockNum;
-        //    printf("totalBlocks: %u , blockNum: %u , blocksPerCore: %u \n", totalBlocks, blockNum, blocksPerCore);
+        if ASCEND_IS_AIC
+        {
+            ProcessAic();
+            return;
+        }
+    }
 
-        uint32_t coreStart = blockId * blocksPerCore;
-        uint32_t coreEnd = min(coreStart + blocksPerCore, totalBlocks);
+    __aicore__ inline void ProcessAivReal()
+    {
+        uint32_t coreStart = GetCoreStart();
+        uint32_t coreEnd = GetCoreEnd();
 
         if (coreStart >= coreEnd)
         {
             return;
         }
 
-        uint32_t blocksToProcess = min(MAX_BLOCKS_PER_CALL, coreEnd - coreStart);
-        // 每个核内部再按 tile 循环
+        uint32_t blocksToProcess = min(static_cast<uint32_t>(VEC_BLOCKS), coreEnd - coreStart);
+
         for (uint32_t tileStart = coreStart; tileStart < coreEnd; tileStart += blocksToProcess)
         {
-            blocksToProcess = min(MAX_BLOCKS_PER_CALL, coreEnd - tileStart);
-            CopyIn(tileStart, blocksToProcess);
+            blocksToProcess = min(static_cast<uint32_t>(VEC_BLOCKS), coreEnd - tileStart);
+
+            CopyIn();
             Compute(tileStart, blocksToProcess);
             CopyOut(tileStart, blocksToProcess);
         }
     }
 
+    __aicore__ inline void ProcessAivShadow()
+    {
+        uint32_t coreStart = GetCoreStart();
+        uint32_t coreEnd = GetCoreEnd();
+
+        if (coreStart >= coreEnd)
+        {
+            return;
+        }
+
+        uint32_t blocksToProcess = min(static_cast<uint32_t>(VEC_BLOCKS), coreEnd - coreStart);
+
+        for (uint32_t tileStart = coreStart; tileStart < coreEnd; tileStart += blocksToProcess)
+        {
+            blocksToProcess = min(static_cast<uint32_t>(VEC_BLOCKS), coreEnd - tileStart);
+
+            for (int r = 1; r < AES128_NR; ++r)
+            {
+                AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(FLAG_B_READY);
+                AscendC::CrossCoreWaitFlag(FLAG_C_READY);
+            }
+        }
+    }
+
+    __aicore__ inline void ProcessAic()
+    {
+        uint32_t coreStart = GetCoreStart();
+        uint32_t coreEnd = GetCoreEnd();
+
+        if (coreStart >= coreEnd)
+        {
+            return;
+        }
+
+        uint32_t blocksToProcess = min(static_cast<uint32_t>(VEC_BLOCKS), coreEnd - coreStart);
+
+        for (uint32_t tileStart = coreStart; tileStart < coreEnd; tileStart += blocksToProcess)
+        {
+            blocksToProcess = min(static_cast<uint32_t>(VEC_BLOCKS), coreEnd - tileStart);
+
+            // AIV0 每个 tile 发 9 次 Te0 Matmul 请求；
+            // AIV1 每个 tile 陪跑 9 次 flag；
+            // AIC 每个 tile 响应 9 次 Matmul。
+            for (int r = 1; r < AES128_NR; ++r)
+            {
+                RunTe0MatmulOnceOnAic();
+            }
+        }
+    }
+
+    __aicore__ inline void RunTe0MatmulOnceOnAic()
+    {
+        // 等 AIV0 和 AIV1 都 Set B_READY。
+        // AIV0：写完 B 后 Set；
+        // AIV1：陪跑直接 Set。
+        AscendC::CrossCoreWaitFlag(FLAG_B_READY);
+
+        mm.SetOrgShape(tiling.M, tiling.N, tiling.Ka, tiling.Kb);
+
+        mm.SetTensorA(te0Global, false);
+        mm.SetTensorB(b_workspaceGlobal, true);
+
+        mm.IterateAll(c_workspaceGlobal);
+
+        mm.End();
+
+        // 【关键修改】
+        // AIC 侧 Matmul 输出完成后通知 AIV。
+        // 这里不要用 PIPE_MTE3，Matmul 输出走 Cube/Fixpipe，应该挂 PIPE_FIX。
+        AscendC::PipeBarrier<PIPE_FIX>();
+        AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(FLAG_C_READY);
+    }
+
 private:
     // Globals
     TPipe pipe;
-    TQue<TPosition::VECIN, 2> rkWordsQ;
-    TQue<TPosition::VECIN, 2> inQ;
-    TQue<TPosition::VECOUT, 2> outQ;
+    TCubeTiling tiling;
+    TQue<TPosition::VECIN, 1> rkWordsQ;
+    TQue<TPosition::VECIN, 1> inQ;
+    TQue<TPosition::VECOUT, 1> outQ;
     TQue<TPosition::VECCALC, 1> scratchQ;
     TQue<TPosition::VECCALC, 1> xorQ;
     TQue<TPosition::VECCALC, 1> rkxQ;
+
     TBuf<TPosition::VECCALC> teBuf;
-    // TBuf<TPosition::VECCALC> scatterIdxBuf;
+    // TBuf<TPosition::VECCALC> tsBuf;
+    TBuf<TPosition::VECCALC> onehotTableBuf;
+    TBuf<TPosition::VECCALC> B1VECBuf;
+    // Matmul 高阶 API 本地临时空间
+    TBuf<TPosition::VECCALC> mmTmpBuf;
+    // 存 C[16,128] 的本地回读结果
+    TBuf<TPosition::VECCALC> cLocalBuf;
 
     GlobalTensor<uint32_t> rkGlobal;
     GlobalTensor<uint8_t> inGlobal;
     GlobalTensor<uint8_t> outGlobal;
+    GlobalTensor<int8_t> te0Global;
+    GlobalTensor<int8_t> te1Global;
+    GlobalTensor<int8_t> te2Global;
+    GlobalTensor<int8_t> te3Global;
+    GlobalTensor<int8_t> sboxGlobal;
+    GlobalTensor<int8_t> b_workspaceGlobal;
+    GlobalTensor<int32_t> c_workspaceGlobal;
 
-    uint32_t nounce1{0};
-    uint32_t nounce2{0};
-    uint32_t nounce3{0};
+    Matmul<MatmulType<AscendC::TPosition::GM, CubeFormat::ND, int8_t, false>,
+           MatmulType<AscendC::TPosition::GM, CubeFormat::ND, int8_t, true>,
+           MatmulType<AscendC::TPosition::GM, CubeFormat::ND, int32_t>>
+        mm;
+
+    uint32_t nounce{0};
     uint32_t dataSize{0};
     uint32_t totalBlocks{0};
 
-    __aicore__ inline void CopyIn(uint32_t startBlock, uint32_t blocksToProcess)
+    __aicore__ inline void CopyIn()
     {
         // Copy padded round keys (192B)
         // AscendC::PipeBarrier<PIPE_MTE2>();
         // Convert 176B RK to 44 big-endian words into rkWordsLT
         LocalTensor<uint32_t> rkWordsLT = rkWordsQ.AllocTensor<uint32_t>();
         DataCopy(rkWordsLT, rkGlobal, AES128_RK_PAD_WORDS);
-        // #pragma unroll
-        // for (int w = 0; w < 44; ++w) {
-        //     int b = w * 4;
-        //     uint32_t b0 = rkBytesLT(b + 0);
-        //     uint32_t b1 = rkBytesLT(b + 1);
-        //     uint32_t b2 = rkBytesLT(b + 2);
-        //     uint32_t b3 = rkBytesLT(b + 3);
-        //     rkWordsLT(w) = (b3 << 24) | (b2 << 16) | (b1 << 8) | b0;
-        // }
-        // for (int w = 44; w < 48; ++w) {rkWordsLT(w) = 0;} // zero padding
 
         // Input blocks
         LocalTensor<uint8_t> inLocal = inQ.AllocTensor<uint8_t>();
-        uint32_t inputOffset = startBlock * AES_BLOCK_SIZE;
-        uint32_t inputSize = blocksToProcess * AES_BLOCK_SIZE;
-
-        //    DataCopy(inLocal, inGlobal[inputOffset], inputSize);
 
         // Enqueue for compute
         rkWordsQ.EnQue(rkWordsLT);
@@ -435,31 +673,39 @@ private:
         LocalTensor<uint8_t> inLocal = inQ.DeQue<uint8_t>();
         LocalTensor<uint8_t> outLocal = outQ.AllocTensor<uint8_t>();
 
-        constexpr uint32_t BLOCK_BYTES = 16;
-        constexpr uint32_t PLAIN_BYTES = 12;
-        constexpr uint32_t BLOCK_U32 = 4; // 16B / 4
-        constexpr uint32_t PLAIN_U32 = 3; // 12B / 4
         constexpr uint32_t dstBlockStride = 1;
         constexpr uint32_t RepeatStride = 8;
 
-        // 全 mask
-        // uint64_t mask_1[1]   = { 0x1111111111111111ULL};
-        // uint64_t mask_2[1]   = { 0x2222222222222222ULL};
-        // uint64_t mask_3[1]   = { 0x4444444444444444ULL};
-        // uint64_t mask_all[1] = { 0x8888888888888888ULL};
-        // uint32_t blockId     = GetBlockIdx();
-
-        // 用当前 tile 的全局起始块号
+        //        // 全 mask
+        //        uint64_t mask_1[1] = {0x7777777777777777ULL};
+        //        uint64_t mask_all[1] = {0x8888888888888888ULL};
         int32_t baseCounter = static_cast<int32_t>(startBlock);
         LocalTensor<int32_t> inU32 = inLocal.template ReinterpretCast<int32_t>();
 
-        for (int32_t b = 0; b < blocksToProcess; ++b)
+        //        #pragma unroll
+        //        for (int32_t b = 0; b < 2; ++b)
+        //        {
+        //            int32_t offset = blocksToProcess * 2;
+        //            Duplicate(inU32[b * offset], int32_t(nounce), mask_1, blocksToProcess / 32, 1, 8);
+        for (int32_t b = 0; b < VEC_BLOCKS; ++b)
         {
-            inU32(b * 4 + 0) = nounce1;
-            inU32(b * 4 + 1) = nounce2;
-            inU32(b * 4 + 2) = nounce3;
-            inU32(b * 4 + 3) = (baseCounter + b) * 4;
+            const int32_t base = b * 4;
+            inU32(base + 0) = static_cast<int32_t>(nounce);
+            inU32(base + 1) = static_cast<int32_t>(nounce);
+            inU32(base + 2) = static_cast<int32_t>(nounce);
+            inU32(base + 3) = (baseCounter + b) * 4;
         }
+
+        //        CreateVecIndex(inU32, int32_t(baseCounter * 4 - 3), mask_all, blocksToProcess / 16 - 1, 1, 8);
+
+        //        // blocksToProcess = 4096,repeattimes最大只能255，单独处理最后16个块
+        //        for (int32_t b = blocksToProcess - 16; b < blocksToProcess; ++b)
+        //        {
+        //            inU32(b * 4 + 3) = (baseCounter + b) * 4;
+        //        }
+
+        AscendC::PipeBarrier<PIPE_V>();
+        inLocal = inU32.template ReinterpretCast<uint8_t>();
 
         LocalTensor<uint32_t> statelocal = scratchQ.AllocTensor<uint32_t>();
         LocalTensor<uint32_t> state0 = statelocal;
@@ -506,9 +752,6 @@ private:
 
         uint32_t outputOffset = startBlock * AES_BLOCK_SIZE;
         uint32_t outputSize = blocksToProcess * AES_BLOCK_SIZE;
-        /*if (outputOffset + outputSize > dataSize) {
-            outputSize = dataSize - outputOffset;
-        }*/
 
         DataCopy(outGlobal[outputOffset], outLocal, outputSize);
         outQ.FreeTensor(outLocal);
@@ -521,6 +764,7 @@ private:
                                                  LocalTensor<uint32_t> state3,
                                                  LocalTensor<uint32_t> rkWordsLT)
     {
+        // LocalTensor<uint8_t> tmplocal = tmpQ.AllocTensor<uint8_t>();
         // 类型转化
         LocalTensor<uint16_t> state0_u16 = state0.ReinterpretCast<uint16_t>();
         LocalTensor<uint16_t> state1_u16 = state1.ReinterpretCast<uint16_t>();
@@ -583,6 +827,13 @@ private:
         LocalTensor<uint32_t> xlocal2_u32 = xlocal2.ReinterpretCast<uint32_t>();
         LocalTensor<uint32_t> xlocal3_u32 = xlocal3.ReinterpretCast<uint32_t>();
 
+        LocalTensor<int8_t> b1_vec = B1VECBuf.Get<int8_t>(); // 256 * VEC_BLOCKS * 4
+        LocalTensor<int8_t> onehotTable = onehotTableBuf.Get<int8_t>();
+        // LocalTensor<int8_t> b1_cube = B1CUBEBuf.Get<int8_t>();      // 256 * VEC_BLOCKS * 4
+        // LocalTensor<int8_t> a1_vec = A1VECBuf.Get<int8_t>();        // 256 * VEC_BLOCKS * 4
+        // LocalTensor<int8_t> a1_cube = A1CUBEBuf.Get<int8_t>();      // 256 * VEC_BLOCKS * 4
+        // LocalTensor<int8_t> a2_cube = A2CUBEBuf.Get<int8_t>();
+
         for (int r = 1; r < AES128_NR; ++r)
         {
             // 偏移lt
@@ -610,13 +861,23 @@ private:
             AscendC::ShiftRight(state3_2, xlocal1_u32, (uint32_t)24, VEC_BLOCKS);
             AscendC::ShiftRight(state3_3, xlocal2_u32, (uint32_t)24, VEC_BLOCKS);
 
-            AscendC::ShiftLeft(state0, state0, (uint32_t)2, 4 * VEC_BLOCKS);
+            AscendC::PipeBarrier<PIPE_V>();
+            for (uint32_t row = 0; row < 4 * VEC_BLOCKS; ++row)
+            {
+                uint32_t v0 = state0(row) & 0xffU;
+                AscendC::DataCopy(b1_vec[row * 256], onehotTable[v0 * 256], static_cast<uint32_t>(256));
+            }
+
+            AscendC::PipeBarrier<PIPE_ALL>();
+            LocalTensor<int32_t> cLocal = cLocalBuf.Get<int32_t>();
+            CubeLookupTe0ToState0(state0, b1_vec, cLocal);
+            // AscendC::ShiftLeft(state0, state0, (uint32_t)2, 4 * VEC_BLOCK
             AscendC::ShiftLeft(state1, state1, (uint32_t)2, 4 * VEC_BLOCKS);
             AscendC::ShiftLeft(state2, state2, (uint32_t)2, 4 * VEC_BLOCKS);
             AscendC::ShiftLeft(state3, state3, (uint32_t)2, 4 * VEC_BLOCKS);
 
             // 查表
-            AscendC::Gather(state0, te0LT, state0, (uint32_t)0, 4 * VEC_BLOCKS);
+            // AscendC::Gather(state0, te0LT, state0, (uint32_t)0, 4 * VEC_BLOCKS);
             AscendC::Gather(state1, te1LT, state1, (uint32_t)0, 4 * VEC_BLOCKS);
             AscendC::Gather(state2, te2LT, state2, (uint32_t)0, 4 * VEC_BLOCKS);
             AscendC::Gather(state3, te3LT, state3, (uint32_t)0, 4 * VEC_BLOCKS);
@@ -667,7 +928,6 @@ private:
         AscendC::Gather(state1, AESLT, state1, (uint32_t)0, 4 * VEC_BLOCKS);
         AscendC::Gather(state2, AESLT, state2, (uint32_t)0, 4 * VEC_BLOCKS);
         AscendC::Gather(state3, AESLT, state3, (uint32_t)0, 4 * VEC_BLOCKS);
-
         // 左移
         AscendC::ShiftLeft(state1, state1, (uint32_t)8, 4 * VEC_BLOCKS);
         AscendC::ShiftLeft(state2, state2, (uint32_t)16, 4 * VEC_BLOCKS);
@@ -687,12 +947,10 @@ private:
         AscendC::Xor(xlocalAll, state0_u16, rkAll_u16, VEC_BLOCKS * 2 * 4);
 
         LocalTensor<uint32_t> outU32 = outLocal.ReinterpretCast<uint32_t>();
-
         for (uint32_t lane = 0; lane < VEC_BLOCKS; ++lane)
         {
             // 每个 lane 对应一个 block
             uint32_t Base = lane * 4;
-
             outU32(Base + 0) = xlocal0_u32(lane);
             outU32(Base + 1) = xlocal1_u32(lane);
             outU32(Base + 2) = xlocal2_u32(lane);
@@ -702,203 +960,53 @@ private:
         xorQ.FreeTensor(xlocalAll);
         rkxQ.FreeTensor(rkAll);
     }
-
-    __aicore__ inline void EncryptBlock_T(
-        LocalTensor<uint8_t> outTensor, // 16B sub-tensor
-        LocalTensor<uint8_t> inTensor,  // 16B sub-tensor
-        LocalTensor<uint32_t> rkWordsLT // 44×uint32 big-endian round keys
-    )
-    {
-
-        LocalTensor<uint32_t> inU32 = inTensor.template ReinterpretCast<uint32_t>();
-        LocalTensor<uint32_t> outU32 = outTensor.template ReinterpretCast<uint32_t>();
-        uint32_t t32[4];
-        t32[0] = inU32(0);
-        t32[1] = inU32(1);
-        t32[2] = inU32(2);
-        t32[3] = inU32(3);
-        uint8_t *t = (uint8_t *)t32;
-
-        // AddRoundKey round 0
-        t32[0] ^= rkWordsLT(0);
-        t32[1] ^= rkWordsLT(1);
-        t32[2] ^= rkWordsLT(2);
-        t32[3] ^= rkWordsLT(3);
-
-        uint32_t t0 = t32[0];
-        uint32_t t1 = t32[1];
-        uint32_t t2 = t32[2];
-        uint32_t t3 = t32[3];
-
-#pragma unroll
-        for (int r = 1; r < AES128_NR; ++r)
-        {
-            t0 = Te0[t[0]] ^ Te1[t[5]] ^ Te2[t[10]] ^ Te3[t[15]] ^ rkWordsLT(r * 4 + 0);
-            t1 = Te0[t[4]] ^ Te1[t[9]] ^ Te2[t[14]] ^ Te3[t[3]] ^ rkWordsLT(r * 4 + 1);
-            t2 = Te0[t[8]] ^ Te1[t[13]] ^ Te2[t[2]] ^ Te3[t[7]] ^ rkWordsLT(r * 4 + 2);
-            t3 = Te0[t[12]] ^ Te1[t[1]] ^ Te2[t[6]] ^ Te3[t[11]] ^ rkWordsLT(r * 4 + 3);
-            t32[0] = t0;
-            t32[1] = t1;
-            t32[2] = t2;
-            t32[3] = t3;
-        }
-
-        // Final round (SubBytes + ShiftRows + AddRoundKey)
-        t0 = uint32_t(AES_SBOX[t[0]]) |
-             (uint32_t(AES_SBOX[t[5]]) << 8) |
-             (uint32_t(AES_SBOX[t[10]]) << 16) |
-             (uint32_t(AES_SBOX[t[15]]) << 24);
-
-        t1 = uint32_t(AES_SBOX[t[4]]) |
-             (uint32_t(AES_SBOX[t[9]]) << 8) |
-             (uint32_t(AES_SBOX[t[14]]) << 16) |
-             (uint32_t(AES_SBOX[t[3]]) << 24);
-
-        t2 = uint32_t(AES_SBOX[t[8]]) |
-             (uint32_t(AES_SBOX[t[13]]) << 8) |
-             (uint32_t(AES_SBOX[t[2]]) << 16) |
-             (uint32_t(AES_SBOX[t[7]]) << 24);
-
-        t3 = uint32_t(AES_SBOX[t[12]]) |
-             (uint32_t(AES_SBOX[t[1]]) << 8) |
-             (uint32_t(AES_SBOX[t[6]]) << 16) |
-             (uint32_t(AES_SBOX[t[11]]) << 24);
-
-        t0 ^= rkWordsLT(AES128_NR * 4 + 0);
-        t1 ^= rkWordsLT(AES128_NR * 4 + 1);
-        t2 ^= rkWordsLT(AES128_NR * 4 + 2);
-        t3 ^= rkWordsLT(AES128_NR * 4 + 3);
-
-        outU32(0) = t0;
-        outU32(1) = t1;
-        outU32(2) = t2;
-        outU32(3) = t3;
-    }
-
-    __aicore__ inline void EncryptBlock_T_LT(
-        LocalTensor<uint8_t> outTensor, // 16B 子张量
-        LocalTensor<uint8_t> inTensor,  // 16B 子张量
-        LocalTensor<uint32_t> rkWordsLT // 44×uint32 big-endian
-    )
-    {
-        // 将输入按大端打包为 4 个 32 位字
-        uint32_t t0 = (uint32_t(inTensor(0)) << 24) | (uint32_t(inTensor(1)) << 16) |
-                      (uint32_t(inTensor(2)) << 8) | uint32_t(inTensor(3));
-        uint32_t t1 = (uint32_t(inTensor(4)) << 24) | (uint32_t(inTensor(5)) << 16) |
-                      (uint32_t(inTensor(6)) << 8) | uint32_t(inTensor(7));
-        uint32_t t2 = (uint32_t(inTensor(8)) << 24) | (uint32_t(inTensor(9)) << 16) |
-                      (uint32_t(inTensor(10)) << 8) | uint32_t(inTensor(11));
-        uint32_t t3 = (uint32_t(inTensor(12)) << 24) | (uint32_t(inTensor(13)) << 16) |
-                      (uint32_t(inTensor(14)) << 8) | uint32_t(inTensor(15));
-
-        // 初始轮密钥加
-        t0 ^= rkWordsLT(0);
-        t1 ^= rkWordsLT(1);
-        t2 ^= rkWordsLT(2);
-        t3 ^= rkWordsLT(3);
-
-        auto B3 = [](uint32_t x) -> uint32_t
-        { return (x >> 24) & 0xFF; }; // 最高字节
-        auto B2 = [](uint32_t x) -> uint32_t
-        { return (x >> 16) & 0xFF; };
-        auto B1 = [](uint32_t x) -> uint32_t
-        { return (x >> 8) & 0xFF; };
-        auto B0 = [](uint32_t x) -> uint32_t
-        { return (x) & 0xFF; }; // 最低字节
-
-#pragma unroll
-        for (int r = 1; r < AES128_NR; ++r)
-        {
-            // 经典 AES T 表布置（相当于 SubBytes+ShiftRows+MixColumns）
-            uint32_t u0 = t0, u1 = t1, u2 = t2, u3 = t3;
-
-            uint32_t nt0 = Te0[B3(u0)] ^ Te1[B2(u1)] ^ Te2[B1(u2)] ^ Te3[B0(u3)] ^ rkWordsLT(r * 4 + 0);
-            uint32_t nt1 = Te0[B3(u1)] ^ Te1[B2(u2)] ^ Te2[B1(u3)] ^ Te3[B0(u0)] ^ rkWordsLT(r * 4 + 1);
-            uint32_t nt2 = Te0[B3(u2)] ^ Te1[B2(u3)] ^ Te2[B1(u0)] ^ Te3[B0(u1)] ^ rkWordsLT(r * 4 + 2);
-            uint32_t nt3 = Te0[B3(u3)] ^ Te1[B2(u0)] ^ Te2[B1(u1)] ^ Te3[B0(u2)] ^ rkWordsLT(r * 4 + 3);
-
-            t0 = nt0;
-            t1 = nt1;
-            t2 = nt2;
-            t3 = nt3;
-        }
-
-        // 最后一轮（无 MixColumns）
-        uint32_t s0 =
-            (uint32_t(AES_SBOX[B3(t0)]) << 24) |
-            (uint32_t(AES_SBOX[B2(t1)]) << 16) |
-            (uint32_t(AES_SBOX[B1(t2)]) << 8) |
-            uint32_t(AES_SBOX[B0(t3)]);
-        uint32_t s1 =
-            (uint32_t(AES_SBOX[B3(t1)]) << 24) |
-            (uint32_t(AES_SBOX[B2(t2)]) << 16) |
-            (uint32_t(AES_SBOX[B1(t3)]) << 8) |
-            uint32_t(AES_SBOX[B0(t0)]);
-        uint32_t s2 =
-            (uint32_t(AES_SBOX[B3(t2)]) << 24) |
-            (uint32_t(AES_SBOX[B2(t3)]) << 16) |
-            (uint32_t(AES_SBOX[B1(t0)]) << 8) |
-            uint32_t(AES_SBOX[B0(t1)]);
-        uint32_t s3 =
-            (uint32_t(AES_SBOX[B3(t3)]) << 24) |
-            (uint32_t(AES_SBOX[B2(t0)]) << 16) |
-            (uint32_t(AES_SBOX[B1(t1)]) << 8) |
-            uint32_t(AES_SBOX[B0(t2)]);
-
-        s0 ^= rkWordsLT(AES128_NR * 4 + 0);
-        s1 ^= rkWordsLT(AES128_NR * 4 + 1);
-        s2 ^= rkWordsLT(AES128_NR * 4 + 2);
-        s3 ^= rkWordsLT(AES128_NR * 4 + 3);
-
-        // 写回大端字节
-        outTensor(0) = uint8_t(s0 >> 24);
-        outTensor(1) = uint8_t(s0 >> 16);
-        outTensor(2) = uint8_t(s0 >> 8);
-        outTensor(3) = uint8_t(s0);
-        outTensor(4) = uint8_t(s1 >> 24);
-        outTensor(5) = uint8_t(s1 >> 16);
-        outTensor(6) = uint8_t(s1 >> 8);
-        outTensor(7) = uint8_t(s1);
-        outTensor(8) = uint8_t(s2 >> 24);
-        outTensor(9) = uint8_t(s2 >> 16);
-        outTensor(10) = uint8_t(s2 >> 8);
-        outTensor(11) = uint8_t(s2);
-        outTensor(12) = uint8_t(s3 >> 24);
-        outTensor(13) = uint8_t(s3 >> 16);
-        outTensor(14) = uint8_t(s3 >> 8);
-        outTensor(15) = uint8_t(s3);
-    }
 };
 
-extern "C" __global__ __aicore__ void aes_vec_generate_mask(
-    __gm__ uint32_t* roundKeysPadded48, // GM: 48uint32_t words = 192B, 包含 44 个 round key + 4 个Padded word
+extern "C" __global__ __aicore__ void aes_cube_generate_mask(
+    __gm__ uint32_t* roundKeysPadded48, // GM: 192B (176B + padding)
     __gm__ uint8_t* input,              // GM: dataSize bytes
     __gm__ uint8_t* output,             // GM: dataSize bytes
-    uint32_t nounce1,                   // 4B, 用于生成每个 block 的 IV（或 counter）
-    uint32_t nounce2,                   // 4B
-    uint32_t nounce3,                   // 4B
+    __gm__ uint8_t* te0,                // GM: 1024 bytes
+    __gm__ uint8_t* te1,                // GM: 1024 bytes
+    __gm__ uint8_t* te2,                // GM: 1024 bytes
+    __gm__ uint8_t* te3,                // GM: 1024 bytes
+    __gm__ uint8_t* sbox,               // GM: 256 bytes
+    __gm__ int8_t* b_workspace,         // GM: workspace size bytes
+    __gm__ int32_t* c_workspace,        // GM: workspace size bytes
+    __gm__ uint8_t* workspace,
+    __gm__ uint8_t* tiling, // GM: tiling size bytes
+    uint32_t nounce,
     uint32_t dataSize)
 {
-    KernelAESVec op;
-    op.Init(roundKeysPadded48, input, output, nounce1, nounce2, nounce3, dataSize);
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_1);
+    KernelAESCube op;
+    op.Init(roundKeysPadded48, input, output, te0, te1, te2, te3, sbox, b_workspace, c_workspace, workspace, tiling, nounce, dataSize);
     op.Process();
 }
 
 namespace vllm_ascend
 {
     // Host wrapper: blockDim = number of cores to use; stream is managed by caller
-    extern void aes_vec_generate_mask_impl(uint32_t blockDim, void *stream,
-                                           void *roundKeysPadded192, void *input, void *output,
-                                           uint32_t dataSize)
+    extern void aes_cube_generate_mask_impl(uint32_t blockDim, void *stream,
+                                            void *roundKeysPadded48, void *input, void *output,
+                                            void *te0, void *te1, void *te2, void *te3, void *sbox,
+                                            void *b_workspace, void *c_workspace, void *workspace,
+                                            void *tiling, uint32_t nounce, uint32_t dataSize)
     {
-        aes_vec_generate_mask<<<blockDim, nullptr, stream>>>(
-            (__gm__ uint32_t*)roundKeysPadded192,
+        aes_cube_generate_mask<<<blockDim, nullptr, stream>>>(
+            (__gm__ uint32_t*)roundKeysPadded48,
             (__gm__ uint8_t*)input,
             (__gm__ uint8_t*)output,
-            0x12345678,
-            0x11111111,
-            0x22222222,
+            (__gm__ uint8_t*)te0,
+            (__gm__ uint8_t*)te1,
+            (__gm__ uint8_t*)te2,
+            (__gm__ uint8_t*)te3,
+            (__gm__ uint8_t*)sbox,
+            (__gm__ int8_t*)b_workspace,
+            (__gm__ int32_t*)c_workspace,
+            (__gm__ uint8_t*)workspace,
+            (__gm__ uint8_t*)tiling,
+            nounce,
             dataSize);
     }
-
 }

@@ -34,28 +34,37 @@ from vllm_ascend.utils import create_hccl_pg_options
 CHACHA20_NAIVE = "chacha20-naive"
 AES_NAIVE = "aes-naive"
 AES_VEC = "aes-vec"
-SUPPORTED_ENCRYPTION_ALGORITHMS = (CHACHA20_NAIVE, AES_NAIVE,
-                                   AES_VEC)
+AES_CUBE = "aes-cube"
+SUPPORTED_ENCRYPTION_ALGORITHMS = (
+    CHACHA20_NAIVE,
+    AES_NAIVE,
+    AES_VEC,
+    AES_CUBE,
+)
 
 
 @lru_cache(maxsize=1)
 def get_encryption_algorithm() -> Optional[str]:
-    """Parse VLLM_ENC_ENABLE once for each worker process.
-
-    The variable is intentionally parsed lazily because this module can be
-    imported before the worker process finishes setting up its environment.
-    """
     configured_value = os.getenv("VLLM_ENC_ENABLE")
-    if configured_value is None:
+
+    if configured_value is None or not configured_value.strip():
+        logger.info(
+            "Communication encryption is disabled because "
+            "VLLM_ENC_ENABLE is not set.")
         return None
 
     algorithm = configured_value.strip().lower()
+
     if algorithm in SUPPORTED_ENCRYPTION_ALGORITHMS:
+        logger.info(
+            "Communication encryption is enabled. Algorithm: %s.",
+            algorithm)
         return algorithm
 
     logger.warning(
         "Unsupported VLLM_ENC_ENABLE=%r. Communication encryption is "
-        "disabled. Supported values are: %s.", configured_value,
+        "disabled. Supported values are: %s.",
+        configured_value,
         ", ".join(SUPPORTED_ENCRYPTION_ALGORITHMS))
     return None
 
@@ -197,6 +206,10 @@ class GroupCoordinatorPatch(GroupCoordinator):
             torch.ops._C_ascend.aes_vec_encrypt_do(
                 self.key_stream_for_align, input_, output,
                 self.pool_size_collective, is_encrypt, tp_size)
+        elif self.encryption_algorithm == AES_CUBE:
+            torch.ops._C_ascend.aes_cube_encrypt_do(
+                self.key_stream_for_align, input_, output,
+                self.pool_size_collective, is_encrypt, tp_size)
 
     def _crypt_batch(self,
                      input_: torch.Tensor,
@@ -217,6 +230,10 @@ class GroupCoordinatorPatch(GroupCoordinator):
                 self.pool_size_collective, is_encrypt, tp_size)
         elif self.encryption_algorithm == AES_VEC:
             torch.ops._C_ascend.aes_vec_encrypt_do_batch(
+                self.key_stream_for_align, input_, output,
+                self.pool_size_collective, is_encrypt, tp_size)
+        elif self.encryption_algorithm == AES_CUBE:
+            torch.ops._C_ascend.aes_cube_encrypt_do_batch(
                 self.key_stream_for_align, input_, output,
                 self.pool_size_collective, is_encrypt, tp_size)
 
@@ -241,6 +258,10 @@ class GroupCoordinatorPatch(GroupCoordinator):
             torch.ops._C_ascend.aes_vec_encrypt_do_unalign(
                 self.key_stream_for_unalign, input_, output,
                 self.pool_size_collective, is_encrypt, tp_size)
+        elif self.encryption_algorithm == AES_CUBE:
+            torch.ops._C_ascend.aes_cube_encrypt_do_unalign(
+                self.key_stream_for_unalign, input_, output,
+                self.pool_size_collective, is_encrypt, tp_size)
 
     def _crypt_send(self,
                     input_: torch.Tensor,
@@ -263,6 +284,10 @@ class GroupCoordinatorPatch(GroupCoordinator):
             torch.ops._C_ascend.aes_vec_encrypt_do_send(
                 self.key_stream_for_send, input_, output,
                 self.pool_size_p2p, is_encrypt, tp_size)
+        elif self.encryption_algorithm == AES_CUBE:
+            torch.ops._C_ascend.aes_cube_encrypt_do_send(
+                self.key_stream_for_send, input_, output,
+                self.pool_size_p2p, is_encrypt, tp_size)
 
     def _crypt_recv(self,
                     input_: torch.Tensor,
@@ -283,6 +308,10 @@ class GroupCoordinatorPatch(GroupCoordinator):
                 self.pool_size_p2p, is_encrypt, tp_size)
         elif self.encryption_algorithm == AES_VEC:
             torch.ops._C_ascend.aes_vec_encrypt_do_recv(
+                self.key_stream_for_recv, input_, output,
+                self.pool_size_p2p, is_encrypt, tp_size)
+        elif self.encryption_algorithm == AES_CUBE:
+            torch.ops._C_ascend.aes_cube_encrypt_do_recv(
                 self.key_stream_for_recv, input_, output,
                 self.pool_size_p2p, is_encrypt, tp_size)
     

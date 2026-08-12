@@ -52,12 +52,36 @@ endif()
 
 include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
 
-file(GLOB KERNEL_FILES
-${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/*.cpp)
+set(
+    AES_CUBE_KERNEL_FILE
+    "${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/aes_cube.cpp"
+)
 
-ascendc_library(vllm_ascend_kernels SHARED
+file(
+    GLOB KERNEL_FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/*.cpp"
+)
+
+# 确保 aes_cube.cpp 不再进入原 shared library
+list(
+    REMOVE_ITEM
+    KERNEL_FILES
+    "${AES_CUBE_KERNEL_FILE}"
+)
+
+# 其他 kernel 保持原来的 shared library
+ascendc_library(
+    vllm_ascend_kernels
+    SHARED
     ${KERNEL_FILES}
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/mla_preprocess/op_kernel/mla_preprocess_kernel.cpp
+)
+
+# AES Cube 完全按照 demo 的方式构建为 STATIC
+ascendc_library(
+    vllm_ascend_aes_cube_kernel
+    STATIC
+    ${AES_CUBE_KERNEL_FILE}
 )
 
 message("TORCH_NPU_PATH is ${TORCH_NPU_PATH}")
@@ -97,7 +121,13 @@ target_link_libraries(
   PUBLIC
   ${TORCH_LIBRARIES}
   libtorch_npu.so
+
+  "-Wl,--whole-archive"
+  vllm_ascend_aes_cube_kernel
+  "-Wl,--no-whole-archive"
+
   vllm_ascend_kernels
+
   ascendcl
   tiling_api
   register
@@ -108,4 +138,9 @@ target_link_libraries(
 
 target_link_options(vllm_ascend_C PRIVATE "-Wl,-rpath,$ORIGIN:$ORIGIN/lib")
 
-install(TARGETS vllm_ascend_C vllm_ascend_kernels DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
+install(
+  TARGETS
+    vllm_ascend_C
+    vllm_ascend_kernels
+  DESTINATION ${VLLM_ASCEND_INSTALL_PATH}
+)

@@ -13,6 +13,15 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <array>
+#include <limits>
+#include <mutex>
+#include <vector>
+#include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <cstdint>
 #include <cstring>
 #include <random>
@@ -29,9 +38,75 @@
 #include "utils.h"
 #include "mla_preprocess/op_host/mla_preprocess.h"
 
+#include "tiling/tiling_api.h"
+#include "tiling/platform/platform_ascendc.h"
+
 namespace vllm_ascend {
 
-aclrtStream enc_stream;
+aclrtStream enc_stream = nullptr;
+
+namespace {
+
+bool parseDynamicStreamEnabled()
+{
+    const char* raw = std::getenv("VLLM_ENC_DYNAMIC_STREAM");
+    if (raw == nullptr || raw[0] == '\0') {
+        return false;
+    }
+
+    std::string value(raw);
+    std::transform(
+        value.begin(),
+        value.end(),
+        value.begin(),
+        [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+
+    if (value == "1" || value == "true" ||
+        value == "on" || value == "yes") {
+        return true;
+    }
+
+    if (value == "0" || value == "false" ||
+        value == "off" || value == "no") {
+        return false;
+    }
+
+    std::fprintf(
+        stderr,
+        "[vllm-ascend] Invalid VLLM_ENC_DYNAMIC_STREAM=%s; "
+        "dynamic stream lookup is disabled. "
+        "Supported values: 0/1, false/true, off/on, no/yes.\n",
+        raw);
+
+    return false;
+}
+
+bool dynamicStreamEnabled()
+{
+    // 每个 worker 第一次调用时解析一次，后面没有 getenv/string 开销。
+    static const bool enabled = parseDynamicStreamEnabled();
+    return enabled;
+}
+
+aclrtStream getEncryptionStream()
+{
+    if (dynamicStreamEnabled()) {
+        // dynamic 模式：每个加解密接口获取一次当前 stream。
+        return c10_npu::getCurrentNPUStream().stream();
+    }
+
+    // 默认模式：只获取一次。
+    if (enc_stream == nullptr) {
+        enc_stream = c10_npu::getCurrentNPUStream().stream();
+    }
+
+    return enc_stream;
+}
+
+}  // namespace
+
 int64_t current_pos = -1;
 int64_t current_pos_unalign = -1;
 int64_t current_pos_send = -1;
@@ -58,9 +133,7 @@ uint8_t key[16] = {
     0x85, 0x7d, 0x77, 0x81
 };
 
-
-void expandKey128(const uint8_t inKey[16], uint8_t outExpanded[176]) {
-    static const uint8_t sbox[256] = {
+static const uint8_t kAesSbox[256] = {
         // 256-byte AES S-box
         0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
         0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
@@ -79,6 +152,9 @@ void expandKey128(const uint8_t inKey[16], uint8_t outExpanded[176]) {
         0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
         0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16
     };
+
+
+void expandKey128(const uint8_t inKey[16], uint8_t outExpanded[176]) {
     static const uint8_t Rcon[11] = {0x00,0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,0x1B,0x36};
 
     std::memcpy(outExpanded, inKey, 16);
@@ -93,7 +169,7 @@ void expandKey128(const uint8_t inKey[16], uint8_t outExpanded[176]) {
             // RotWord
             uint8_t tmp = t[0]; t[0] = t[1]; t[1] = t[2]; t[2] = t[3]; t[3] = tmp;
             // SubWord
-            for (int i = 0; i < 4; ++i) t[i] = sbox[t[i]];
+            for (int i = 0; i < 4; ++i) t[i] = kAesSbox[t[i]];
             // Rcon
             t[0] ^= Rcon[rconIter++];
         }
@@ -113,7 +189,7 @@ void expandKey128(const uint8_t inKey[16], uint8_t outExpanded[176]) {
             // RotWord
             uint8_t tmp = t[0]; t[0] = t[1]; t[1] = t[2]; t[2] = t[3]; t[3] = tmp;
             // SubWord
-            for (int i = 0; i < 4; ++i) t[i] = sbox[t[i]];
+            for (int i = 0; i < 4; ++i) t[i] = kAesSbox[t[i]];
             // Rcon
             t[0] ^= Rcon[rconIter++];
         }
@@ -128,6 +204,170 @@ void padRoundKeys192(const uint8_t rk176[AES128_RK_BYTES], uint8_t rk192[AES128_
     std::memcpy(rk192, rk176, AES128_RK_BYTES);
     std::memset(rk192 + AES128_RK_BYTES, 0, AES128_RK_PAD_BYTES - AES128_RK_BYTES);
 }
+
+namespace {
+
+constexpr uint32_t kAesCubeBlockDim = 1024;
+constexpr uint32_t kAesCubeNonce = 0x69696969U;
+constexpr size_t kAesCubeBBytesPerBlock = 32U * 4U * 256U;
+constexpr size_t kAesCubeCBytesPerBlock =
+    16U * 32U * 4U * sizeof(int32_t);
+
+void checkAcl(aclError status, const char* operation)
+{
+    TORCH_CHECK(status == ACL_SUCCESS, operation,
+                " failed, acl error=", static_cast<int>(status));
+}
+
+class AesCubeResources {
+public:
+    static AesCubeResources& instance()
+    {
+        static AesCubeResources resources;
+        return resources;
+    }
+
+    void generate(void* stream, void* output, uint32_t dataSize,
+                  const uint8_t roundKeys192[AES128_RK_PAD_BYTES])
+    {
+        std::call_once(initOnce_, [this, roundKeys192]() {
+            initialize(roundKeys192);
+        });
+
+        aes_cube_generate_mask_impl(
+            kAesCubeBlockDim, stream, roundKeys_, output, output,
+            te0_, te1_, te2_, te3_, sbox_, bWorkspace_, cWorkspace_,
+            systemWorkspace_, tiling_, kAesCubeNonce, dataSize);
+    }
+
+private:
+    static uint8_t xtime(uint8_t value)
+    {
+        return static_cast<uint8_t>((value << 1) ^
+            ((value & 0x80U) ? 0x1bU : 0U));
+    }
+
+    static uint32_t rotateLeft(uint32_t value, uint32_t bits)
+    {
+        return (value << bits) | (value >> (32U - bits));
+    }
+
+    static void allocate(void** ptr, size_t bytes, const char* name)
+    {
+        checkAcl(aclrtMalloc(ptr, bytes, ACL_MEM_MALLOC_HUGE_FIRST), name);
+    }
+
+    static void copyToDevice(void* dst, size_t bytes, const void* src,
+                             const char* name)
+    {
+        checkAcl(aclrtMemcpy(dst, bytes, src, bytes,
+                            ACL_MEMCPY_HOST_TO_DEVICE), name);
+    }
+
+    void initialize(const uint8_t roundKeys192[AES128_RK_PAD_BYTES])
+    {
+        // Cube Demo 当前只在 Ascend910B2 上验证；这里不要使用 310P。
+        auto platform = platform_ascendc::PlatformAscendCManager::GetInstance(
+            "Ascend910B2");
+        TORCH_CHECK(platform != nullptr,
+                    "Cannot create AscendC platform for AES-Cube");
+
+        matmul_tiling::MatmulApiTiling cubeTiling(*platform);
+        cubeTiling.SetAType(matmul_tiling::TPosition::GM,
+                            matmul_tiling::CubeFormat::ND,
+                            matmul_tiling::DataType::DT_INT8, false);
+        cubeTiling.SetBType(matmul_tiling::TPosition::GM,
+                            matmul_tiling::CubeFormat::ND,
+                            matmul_tiling::DataType::DT_INT8, true);
+        cubeTiling.SetCType(matmul_tiling::TPosition::GM,
+                            matmul_tiling::CubeFormat::ND,
+                            matmul_tiling::DataType::DT_INT32);
+        cubeTiling.EnableBias(false);
+        cubeTiling.SetShape(16, 128, 256);
+        cubeTiling.SetOrgShape(16, 128, 256);
+        cubeTiling.SetBufferSpace(-1, -1, 64 * 1024);
+
+        optiling::TCubeTiling tilingData;
+        TORCH_CHECK(cubeTiling.GetTiling(tilingData) != -1,
+                    "AES-Cube matmul tiling generation failed");
+        const uint32_t tilingDataSize = tilingData.GetDataSize();
+        std::vector<uint8_t> tilingHost(tilingDataSize + sizeof(uint64_t));
+        tilingData.SaveToBuffer(tilingHost.data(), tilingDataSize);
+        uint64_t ubSize = 0;
+        platform->GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
+        std::memcpy(tilingHost.data() + tilingDataSize,
+                    &ubSize, sizeof(ubSize));
+
+        std::array<int8_t, 16 * 256> te0{};
+        std::array<uint32_t, 256> te1{};
+        std::array<uint32_t, 256> te2{};
+        std::array<uint32_t, 256> te3{};
+        std::array<uint32_t, 256> sbox{};
+        for (size_t i = 0; i < 256; ++i) {
+            const uint8_t s = kAesSbox[i];
+            const uint8_t x2 = xtime(s);
+            const uint8_t x3 = static_cast<uint8_t>(x2 ^ s);
+            te0[0 * 256 + i] = static_cast<int8_t>(x3);
+            te0[1 * 256 + i] = static_cast<int8_t>(s);
+            te0[2 * 256 + i] = static_cast<int8_t>(s);
+            te0[3 * 256 + i] = static_cast<int8_t>(x2);
+            const uint32_t packed =
+                (static_cast<uint32_t>(x3) << 24) |
+                (static_cast<uint32_t>(s) << 16) |
+                (static_cast<uint32_t>(s) << 8) |
+                static_cast<uint32_t>(x2);
+            te1[i] = rotateLeft(packed, 8);
+            te2[i] = rotateLeft(packed, 16);
+            te3[i] = rotateLeft(packed, 24);
+            sbox[i] = s;
+        }
+
+        const size_t systemBytes =
+            static_cast<size_t>(platform->GetLibApiWorkSpaceSize());
+        TORCH_CHECK(systemBytes > 0,
+                    "AES-Cube Matmul system workspace size is zero");
+
+        allocate(&roundKeys_, AES128_RK_PAD_BYTES, "aclrtMalloc(roundKeys)");
+        allocate(&te0_, sizeof(te0), "aclrtMalloc(te0)");
+        allocate(&te1_, sizeof(te1), "aclrtMalloc(te1)");
+        allocate(&te2_, sizeof(te2), "aclrtMalloc(te2)");
+        allocate(&te3_, sizeof(te3), "aclrtMalloc(te3)");
+        allocate(&sbox_, sizeof(sbox), "aclrtMalloc(sbox)");
+        allocate(&bWorkspace_, kAesCubeBBytesPerBlock * kAesCubeBlockDim,
+                 "aclrtMalloc(B workspace)");
+        allocate(&cWorkspace_, kAesCubeCBytesPerBlock * kAesCubeBlockDim,
+                 "aclrtMalloc(C workspace)");
+        allocate(&systemWorkspace_, systemBytes,
+                 "aclrtMalloc(system workspace)");
+        allocate(&tiling_, tilingHost.size(), "aclrtMalloc(tiling)");
+
+        copyToDevice(roundKeys_, AES128_RK_PAD_BYTES, roundKeys192,
+                     "copy round keys");
+        copyToDevice(te0_, sizeof(te0), te0.data(), "copy te0");
+        copyToDevice(te1_, sizeof(te1), te1.data(), "copy te1");
+        copyToDevice(te2_, sizeof(te2), te2.data(), "copy te2");
+        copyToDevice(te3_, sizeof(te3), te3.data(), "copy te3");
+        copyToDevice(sbox_, sizeof(sbox), sbox.data(), "copy sbox");
+        copyToDevice(tiling_, tilingHost.size(), tilingHost.data(),
+                     "copy tiling");
+        checkAcl(aclrtMemset(systemWorkspace_, systemBytes, 0, systemBytes),
+                 "clear system workspace");
+    }
+
+    std::once_flag initOnce_;
+    void* roundKeys_ = nullptr;
+    void* te0_ = nullptr;
+    void* te1_ = nullptr;
+    void* te2_ = nullptr;
+    void* te3_ = nullptr;
+    void* sbox_ = nullptr;
+    void* bWorkspace_ = nullptr;
+    void* cWorkspace_ = nullptr;
+    void* systemWorkspace_ = nullptr;
+    void* tiling_ = nullptr;
+};
+
+} // namespace
 
 AscendType get_dtype_from_torch(at::ScalarType scalarType)
 {
@@ -581,17 +821,15 @@ void chacha20_naive_encrypt_do(
 
     uint32_t maxValue = 4096;
 
-    if (!enc_stream) {
-        enc_stream = c10_npu::getCurrentNPUStream().stream();
-    }
+    const aclrtStream stream = getEncryptionStream();
 
     if (current_pos + data_size / tp_size > element_count) {
         at::Tensor state = at::rand({64}, key_stream.options());
         void* state_ptr = state.data_ptr();
         at_npu::native::OpCommand cmd;
         cmd.Name("chacha20_naive_generate_mask");
-        cmd.SetCustomHandler([threadnum, state_ptr, base_ptr, element_count]() -> int {
-            chacha20_naive_generate_mask_impl(threadnum, enc_stream, state_ptr, base_ptr, element_count);
+        cmd.SetCustomHandler([stream, threadnum, state_ptr, base_ptr, element_count]() -> int {
+            chacha20_naive_generate_mask_impl(threadnum, stream, state_ptr, base_ptr, element_count);
             return 0;
         });
         cmd.Run();
@@ -604,8 +842,8 @@ void chacha20_naive_encrypt_do(
         cmd.Name("xor_do");
         void* input_ptr_ = (void*)(input_ptr + i * (data_size / tp_size));
         void* output_ptr_ = (void*)(output_ptr + i * (data_size / tp_size));
-        cmd.SetCustomHandler([key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
-            xor_do_impl(enc_stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
+        cmd.SetCustomHandler([stream, key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
+            xor_do_impl(stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
             return 0;
         });
         cmd.Run();
@@ -638,17 +876,15 @@ void chacha20_naive_encrypt_do_batch(
 
     uint32_t maxValue = 4096;
 
-    if (!enc_stream) {
-        enc_stream = c10_npu::getCurrentNPUStream().stream();
-    }
+    const aclrtStream stream = getEncryptionStream();
 
     if (current_pos + data_size / tp_size > element_count) {
         at::Tensor state = at::rand({64}, key_stream.options());
         void* state_ptr = state.data_ptr();
         at_npu::native::OpCommand cmd;
         cmd.Name("chacha20_naive_generate_mask");
-        cmd.SetCustomHandler([threadnum, state_ptr, base_ptr, element_count]() -> int {
-            chacha20_naive_generate_mask_impl(threadnum, enc_stream, state_ptr, base_ptr, element_count);
+        cmd.SetCustomHandler([stream, threadnum, state_ptr, base_ptr, element_count]() -> int {
+            chacha20_naive_generate_mask_impl(threadnum, stream, state_ptr, base_ptr, element_count);
             return 0;
         });
         cmd.Run();
@@ -661,8 +897,8 @@ void chacha20_naive_encrypt_do_batch(
         cmd.Name("xor_do_batch");
         void* input_ptr_ = (void*)input_ptr;
         void* output_ptr_ = (void*)output_ptr;
-        cmd.SetCustomHandler([key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
-            xor_do_batch_impl(enc_stream, key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue);
+        cmd.SetCustomHandler([stream, key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
+            xor_do_batch_impl(stream, key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue);
             return 0;
         });
         cmd.Run();
@@ -696,17 +932,15 @@ void chacha20_naive_encrypt_do_unalign(
 
     uint32_t maxValue = 4096;
 
-    if (!enc_stream) {
-        enc_stream = c10_npu::getCurrentNPUStream().stream();
-    }
+    const aclrtStream stream = getEncryptionStream();
 
     if (current_pos_unalign + localSizePadding > element_count) {
         at::Tensor state = at::rand({64}, key_stream.options());
         void* state_ptr = state.data_ptr();
         at_npu::native::OpCommand cmd;
         cmd.Name("chacha20_naive_generate_mask");
-        cmd.SetCustomHandler([threadnum, state_ptr, base_ptr, element_count]() -> int {
-            chacha20_naive_generate_mask_impl(threadnum, enc_stream, state_ptr, base_ptr, element_count);
+        cmd.SetCustomHandler([stream, threadnum, state_ptr, base_ptr, element_count]() -> int {
+            chacha20_naive_generate_mask_impl(threadnum, stream, state_ptr, base_ptr, element_count);
             return 0;
         });
         cmd.Run();
@@ -719,8 +953,8 @@ void chacha20_naive_encrypt_do_unalign(
         cmd.Name("xor_do_unalign");
         void* input_ptr_ = (void*)(input_ptr + i * (data_size / tp_size));
         void* output_ptr_ = (void*)(output_ptr + i * (data_size / tp_size));
-        cmd.SetCustomHandler([key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
-            xor_do_unalign_impl(enc_stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
+        cmd.SetCustomHandler([stream, key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
+            xor_do_unalign_impl(stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
             return 0;
         });
         cmd.Run();
@@ -756,17 +990,15 @@ void chacha20_naive_encrypt_do_send(
 
     // bool exists = std::find(intVector.begin(), intVector.end(), data_size) != intVector.end();
 
-    if (!enc_stream) {
-        enc_stream = c10_npu::getCurrentNPUStream().stream();
-    }
+    const aclrtStream stream = getEncryptionStream();
 
     if (current_pos_send + localSizePadding > element_count) {
         at::Tensor state = at::rand({64}, key_stream.options());
         void* state_ptr = state.data_ptr();
         at_npu::native::OpCommand cmd;
         cmd.Name("chacha20_naive_generate_mask");
-        cmd.SetCustomHandler([threadnum, state_ptr, base_ptr, element_count]() -> int {
-            chacha20_naive_generate_mask_impl(threadnum, enc_stream, state_ptr, base_ptr, element_count);
+        cmd.SetCustomHandler([stream, threadnum, state_ptr, base_ptr, element_count]() -> int {
+            chacha20_naive_generate_mask_impl(threadnum, stream, state_ptr, base_ptr, element_count);
             return 0;
         });
         cmd.Run();
@@ -779,8 +1011,8 @@ void chacha20_naive_encrypt_do_send(
         cmd.Name("xor_do_unalign");
         void* input_ptr_ = (void*)(input_ptr + i * (data_size / tp_size));
         void* output_ptr_ = (void*)(output_ptr + i * (data_size / tp_size));
-        cmd.SetCustomHandler([key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
-            xor_do_unalign_impl(enc_stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
+        cmd.SetCustomHandler([stream, key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
+            xor_do_unalign_impl(stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
             return 0;
         });
         cmd.Run();
@@ -814,17 +1046,15 @@ void chacha20_naive_encrypt_do_recv(
 
     // bool exists = std::find(intVector.begin(), intVector.end(), data_size) != intVector.end();
 
-    if (!enc_stream) {
-        enc_stream = c10_npu::getCurrentNPUStream().stream();
-    }
+    const aclrtStream stream = getEncryptionStream();
 
     if (current_pos_recv + localSizePadding > element_count) {
         at::Tensor state = at::rand({64}, key_stream.options());
         void* state_ptr = state.data_ptr();
         at_npu::native::OpCommand cmd;
         cmd.Name("chacha20_naive_generate_mask");
-        cmd.SetCustomHandler([threadnum, state_ptr, base_ptr, element_count]() -> int {
-            chacha20_naive_generate_mask_impl(threadnum, enc_stream, state_ptr, base_ptr, element_count);
+        cmd.SetCustomHandler([stream, threadnum, state_ptr, base_ptr, element_count]() -> int {
+            chacha20_naive_generate_mask_impl(threadnum, stream, state_ptr, base_ptr, element_count);
             return 0;
         });
         cmd.Run();
@@ -837,8 +1067,8 @@ void chacha20_naive_encrypt_do_recv(
         cmd.Name("xor_do_unalign");
         void* input_ptr_ = (void*)(input_ptr + i * (data_size / tp_size));
         void* output_ptr_ = (void*)(output_ptr + i * (data_size / tp_size));
-        cmd.SetCustomHandler([key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
-            xor_do_unalign_impl(enc_stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
+        cmd.SetCustomHandler([stream, key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
+            xor_do_unalign_impl(stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
             return 0;
         });
         cmd.Run();
@@ -870,9 +1100,7 @@ void aes_naive_encrypt_do_batch(
 
     // bool exists = std::find(intVector.begin(), intVector.end(), data_size) != intVector.end();
 
-    if (!enc_stream) {
-        enc_stream = c10_npu::getCurrentNPUStream().stream();
-    }
+    const aclrtStream stream = getEncryptionStream();
 
     if (current_pos + data_size / tp_size > element_count) {
         printf("generating key stream...\n");
@@ -889,8 +1117,8 @@ void aes_naive_encrypt_do_batch(
 
         at_npu::native::OpCommand cmd;
         cmd.Name("aes_naive_generate_mask");
-        cmd.SetCustomHandler([kernelBlocks, deviceRoundKeys, base_ptr, element_count]() -> int {
-            aes_naive_generate_mask_impl(kernelBlocks, enc_stream, deviceRoundKeys, base_ptr, base_ptr, static_cast<uint32_t>(element_count));
+        cmd.SetCustomHandler([stream, kernelBlocks, deviceRoundKeys, base_ptr, element_count]() -> int {
+            aes_naive_generate_mask_impl(kernelBlocks, stream, deviceRoundKeys, base_ptr, base_ptr, static_cast<uint32_t>(element_count));
             return 0;
         });
         cmd.Run();
@@ -905,8 +1133,8 @@ void aes_naive_encrypt_do_batch(
         cmd.Name("xor_do_batch");
         void* input_ptr_ = (void*)input_ptr;
         void* output_ptr_ = (void*)output_ptr;
-        cmd.SetCustomHandler([key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
-            xor_do_batch_impl(enc_stream, key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue);
+        cmd.SetCustomHandler([stream, key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
+            xor_do_batch_impl(stream, key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue);
             return 0;
         });
         cmd.Run();
@@ -940,9 +1168,7 @@ void aes_naive_encrypt_do(
 
     // bool exists = std::find(intVector.begin(), intVector.end(), data_size) != intVector.end();
 
-    if (!enc_stream) {
-        enc_stream = c10_npu::getCurrentNPUStream().stream();
-    }
+    const aclrtStream stream = getEncryptionStream();
 
     if (current_pos + data_size / tp_size > element_count) {
         printf("generating key stream...\n");
@@ -959,8 +1185,8 @@ void aes_naive_encrypt_do(
 
         at_npu::native::OpCommand cmd;
         cmd.Name("aes_naive_generate_mask");
-        cmd.SetCustomHandler([kernelBlocks, deviceRoundKeys, base_ptr, element_count]() -> int {
-            aes_naive_generate_mask_impl(kernelBlocks, enc_stream, deviceRoundKeys, base_ptr, base_ptr, static_cast<uint32_t>(element_count));
+        cmd.SetCustomHandler([stream, kernelBlocks, deviceRoundKeys, base_ptr, element_count]() -> int {
+            aes_naive_generate_mask_impl(kernelBlocks, stream, deviceRoundKeys, base_ptr, base_ptr, static_cast<uint32_t>(element_count));
             return 0;
         });
         cmd.Run();
@@ -975,8 +1201,8 @@ void aes_naive_encrypt_do(
         cmd.Name("xor_do");
         void* input_ptr_ = (void*)(input_ptr + i * (data_size / tp_size));
         void* output_ptr_ = (void*)(output_ptr + i * (data_size / tp_size));
-        cmd.SetCustomHandler([key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
-            xor_do_impl(enc_stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
+        cmd.SetCustomHandler([stream, key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
+            xor_do_impl(stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
             return 0;
         });
         cmd.Run();
@@ -1011,9 +1237,7 @@ void aes_naive_encrypt_do_unalign(
 
     // bool exists = std::find(intVector.begin(), intVector.end(), data_size) != intVector.end();
 
-    if (!enc_stream) {
-        enc_stream = c10_npu::getCurrentNPUStream().stream();
-    }
+    const aclrtStream stream = getEncryptionStream();
 
     if (current_pos_unalign + localSizePadding > element_count) {
         uint32_t totalBlocks = static_cast<uint32_t>((element_count + AES_BLOCK_SIZE - 1) / AES_BLOCK_SIZE);
@@ -1029,8 +1253,8 @@ void aes_naive_encrypt_do_unalign(
 
         at_npu::native::OpCommand cmd;
         cmd.Name("aes_naive_generate_mask");
-        cmd.SetCustomHandler([kernelBlocks, deviceRoundKeys, base_ptr, element_count]() -> int {
-            aes_naive_generate_mask_impl(kernelBlocks, enc_stream, deviceRoundKeys, base_ptr, base_ptr, static_cast<uint32_t>(element_count));
+        cmd.SetCustomHandler([stream, kernelBlocks, deviceRoundKeys, base_ptr, element_count]() -> int {
+            aes_naive_generate_mask_impl(kernelBlocks, stream, deviceRoundKeys, base_ptr, base_ptr, static_cast<uint32_t>(element_count));
             return 0;
         });
         cmd.Run();
@@ -1043,8 +1267,8 @@ void aes_naive_encrypt_do_unalign(
         cmd.Name("xor_do_unalign");
         void* input_ptr_ = (void*)(input_ptr + i * (data_size / tp_size));
         void* output_ptr_ = (void*)(output_ptr + i * (data_size / tp_size));
-        cmd.SetCustomHandler([key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
-            xor_do_unalign_impl(enc_stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
+        cmd.SetCustomHandler([stream, key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
+            xor_do_unalign_impl(stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
             return 0;
         });
         cmd.Run();
@@ -1079,9 +1303,7 @@ void aes_naive_encrypt_do_send(
 
     // bool exists = std::find(intVector.begin(), intVector.end(), data_size) != intVector.end();
 
-    if (!enc_stream) {
-        enc_stream = c10_npu::getCurrentNPUStream().stream();
-    }
+    const aclrtStream stream = getEncryptionStream();
 
     if (current_pos_send + localSizePadding > element_count) {
         uint32_t totalBlocks = static_cast<uint32_t>((element_count + AES_BLOCK_SIZE - 1) / AES_BLOCK_SIZE);
@@ -1097,8 +1319,8 @@ void aes_naive_encrypt_do_send(
 
         at_npu::native::OpCommand cmd;
         cmd.Name("aes_naive_generate_mask");
-        cmd.SetCustomHandler([kernelBlocks, deviceRoundKeys, base_ptr, element_count]() -> int {
-            aes_naive_generate_mask_impl(kernelBlocks, enc_stream, deviceRoundKeys, base_ptr, base_ptr, static_cast<uint32_t>(element_count));
+        cmd.SetCustomHandler([stream, kernelBlocks, deviceRoundKeys, base_ptr, element_count]() -> int {
+            aes_naive_generate_mask_impl(kernelBlocks, stream, deviceRoundKeys, base_ptr, base_ptr, static_cast<uint32_t>(element_count));
             return 0;
         });
         cmd.Run();
@@ -1111,8 +1333,8 @@ void aes_naive_encrypt_do_send(
         cmd.Name("xor_do_unalign");
         void* input_ptr_ = (void*)(input_ptr + i * (data_size / tp_size));
         void* output_ptr_ = (void*)(output_ptr + i * (data_size / tp_size));
-        cmd.SetCustomHandler([key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
-            xor_do_unalign_impl(enc_stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
+        cmd.SetCustomHandler([stream, key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
+            xor_do_unalign_impl(stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
             return 0;
         });
         cmd.Run();
@@ -1145,9 +1367,7 @@ void aes_naive_encrypt_do_recv(
 
     // bool exists = std::find(intVector.begin(), intVector.end(), data_size) != intVector.end();
 
-    if (!enc_stream) {
-        enc_stream = c10_npu::getCurrentNPUStream().stream();
-    }
+    const aclrtStream stream = getEncryptionStream();
 
     if (current_pos_recv + localSizePadding > element_count) {
         uint32_t totalBlocks = static_cast<uint32_t>((element_count + AES_BLOCK_SIZE - 1) / AES_BLOCK_SIZE);
@@ -1163,8 +1383,8 @@ void aes_naive_encrypt_do_recv(
 
         at_npu::native::OpCommand cmd;
         cmd.Name("aes_naive_generate_mask");
-        cmd.SetCustomHandler([kernelBlocks, deviceRoundKeys, base_ptr, element_count]() -> int {
-            aes_naive_generate_mask_impl(kernelBlocks, enc_stream, deviceRoundKeys, base_ptr, base_ptr, static_cast<uint32_t>(element_count));
+        cmd.SetCustomHandler([stream, kernelBlocks, deviceRoundKeys, base_ptr, element_count]() -> int {
+            aes_naive_generate_mask_impl(kernelBlocks, stream, deviceRoundKeys, base_ptr, base_ptr, static_cast<uint32_t>(element_count));
             return 0;
         });
         cmd.Run();
@@ -1177,8 +1397,8 @@ void aes_naive_encrypt_do_recv(
         cmd.Name("xor_do_unalign");
         void* input_ptr_ = (void*)(input_ptr + i * (data_size / tp_size));
         void* output_ptr_ = (void*)(output_ptr + i * (data_size / tp_size));
-        cmd.SetCustomHandler([key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
-            xor_do_unalign_impl(enc_stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
+        cmd.SetCustomHandler([stream, key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
+            xor_do_unalign_impl(stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
             return 0;
         });
         cmd.Run();
@@ -1210,9 +1430,7 @@ void aes_vec_encrypt_do_batch(
 
     // bool exists = std::find(intVector.begin(), intVector.end(), data_size) != intVector.end();
 
-    if (!enc_stream) {
-        enc_stream = c10_npu::getCurrentNPUStream().stream();
-    }
+    const aclrtStream stream = getEncryptionStream();
 
     if (current_pos + data_size / tp_size > element_count) {
         const uint32_t threadnum = AES_VEC_THREAD_NUM;
@@ -1227,8 +1445,8 @@ void aes_vec_encrypt_do_batch(
 
         at_npu::native::OpCommand cmd;
         cmd.Name("aes_vec_generate_mask");
-        cmd.SetCustomHandler([threadnum, deviceRoundKeys, base_ptr, element_count]() -> int {
-            aes_vec_generate_mask_impl(threadnum, enc_stream, deviceRoundKeys, base_ptr, base_ptr,
+        cmd.SetCustomHandler([stream, threadnum, deviceRoundKeys, base_ptr, element_count]() -> int {
+            aes_vec_generate_mask_impl(threadnum, stream, deviceRoundKeys, base_ptr, base_ptr,
                                        static_cast<uint32_t>(element_count));
             return 0;
         });
@@ -1244,8 +1462,8 @@ void aes_vec_encrypt_do_batch(
         cmd.Name("xor_do_batch");
         void* input_ptr_ = (void*)input_ptr;
         void* output_ptr_ = (void*)output_ptr;
-        cmd.SetCustomHandler([key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
-            xor_do_batch_impl(enc_stream, key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue);
+        cmd.SetCustomHandler([stream, key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
+            xor_do_batch_impl(stream, key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue);
             return 0;
         });
         cmd.Run();
@@ -1279,9 +1497,7 @@ void aes_vec_encrypt_do(
 
     // bool exists = std::find(intVector.begin(), intVector.end(), data_size) != intVector.end();
 
-    if (!enc_stream) {
-        enc_stream = c10_npu::getCurrentNPUStream().stream();
-    }
+    const aclrtStream stream = getEncryptionStream();
 
     if (current_pos + data_size / tp_size > element_count) {
         const uint32_t threadnum = AES_VEC_THREAD_NUM;
@@ -1296,8 +1512,8 @@ void aes_vec_encrypt_do(
 
         at_npu::native::OpCommand cmd;
         cmd.Name("aes_vec_generate_mask");
-        cmd.SetCustomHandler([threadnum, deviceRoundKeys, base_ptr, element_count]() -> int {
-            aes_vec_generate_mask_impl(threadnum, enc_stream, deviceRoundKeys, base_ptr, base_ptr,
+        cmd.SetCustomHandler([stream, threadnum, deviceRoundKeys, base_ptr, element_count]() -> int {
+            aes_vec_generate_mask_impl(threadnum, stream, deviceRoundKeys, base_ptr, base_ptr,
                                        static_cast<uint32_t>(element_count));
             return 0;
         });
@@ -1313,8 +1529,8 @@ void aes_vec_encrypt_do(
         cmd.Name("xor_do");
         void* input_ptr_ = (void*)(input_ptr + i * (data_size / tp_size));
         void* output_ptr_ = (void*)(output_ptr + i * (data_size / tp_size));
-        cmd.SetCustomHandler([key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
-            xor_do_impl(enc_stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
+        cmd.SetCustomHandler([stream, key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
+            xor_do_impl(stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
             return 0;
         });
         cmd.Run();
@@ -1349,9 +1565,7 @@ void aes_vec_encrypt_do_unalign(
 
     // bool exists = std::find(intVector.begin(), intVector.end(), data_size) != intVector.end();
 
-    if (!enc_stream) {
-        enc_stream = c10_npu::getCurrentNPUStream().stream();
-    }
+    const aclrtStream stream = getEncryptionStream();
 
     if (current_pos_unalign + localSizePadding > element_count) {
         const uint32_t threadnum = AES_VEC_THREAD_NUM;
@@ -1366,8 +1580,8 @@ void aes_vec_encrypt_do_unalign(
 
         at_npu::native::OpCommand cmd;
         cmd.Name("aes_vec_generate_mask");
-        cmd.SetCustomHandler([threadnum, deviceRoundKeys, base_ptr, element_count]() -> int {
-            aes_vec_generate_mask_impl(threadnum, enc_stream, deviceRoundKeys, base_ptr, base_ptr,
+        cmd.SetCustomHandler([stream, threadnum, deviceRoundKeys, base_ptr, element_count]() -> int {
+            aes_vec_generate_mask_impl(threadnum, stream, deviceRoundKeys, base_ptr, base_ptr,
                                        static_cast<uint32_t>(element_count));
             return 0;
         });
@@ -1381,8 +1595,8 @@ void aes_vec_encrypt_do_unalign(
         cmd.Name("xor_do_unalign");
         void* input_ptr_ = (void*)(input_ptr + i * (data_size / tp_size));
         void* output_ptr_ = (void*)(output_ptr + i * (data_size / tp_size));
-        cmd.SetCustomHandler([key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
-            xor_do_unalign_impl(enc_stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
+        cmd.SetCustomHandler([stream, key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
+            xor_do_unalign_impl(stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
             return 0;
         });
         cmd.Run();
@@ -1417,9 +1631,7 @@ void aes_vec_encrypt_do_send(
 
     // bool exists = std::find(intVector.begin(), intVector.end(), data_size) != intVector.end();
 
-    if (!enc_stream) {
-        enc_stream = c10_npu::getCurrentNPUStream().stream();
-    }
+    const aclrtStream stream = getEncryptionStream();
 
     if (current_pos_send + localSizePadding > element_count) {
         const uint32_t threadnum = AES_VEC_THREAD_NUM;
@@ -1434,8 +1646,8 @@ void aes_vec_encrypt_do_send(
 
         at_npu::native::OpCommand cmd;
         cmd.Name("aes_vec_generate_mask");
-        cmd.SetCustomHandler([threadnum, deviceRoundKeys, base_ptr, element_count]() -> int {
-            aes_vec_generate_mask_impl(threadnum, enc_stream, deviceRoundKeys, base_ptr, base_ptr,
+        cmd.SetCustomHandler([stream, threadnum, deviceRoundKeys, base_ptr, element_count]() -> int {
+            aes_vec_generate_mask_impl(threadnum, stream, deviceRoundKeys, base_ptr, base_ptr,
                                        static_cast<uint32_t>(element_count));
             return 0;
         });
@@ -1449,8 +1661,8 @@ void aes_vec_encrypt_do_send(
         cmd.Name("xor_do_unalign");
         void* input_ptr_ = (void*)(input_ptr + i * (data_size / tp_size));
         void* output_ptr_ = (void*)(output_ptr + i * (data_size / tp_size));
-        cmd.SetCustomHandler([key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
-            xor_do_unalign_impl(enc_stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
+        cmd.SetCustomHandler([stream, key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
+            xor_do_unalign_impl(stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
             return 0;
         });
         cmd.Run();
@@ -1483,9 +1695,7 @@ void aes_vec_encrypt_do_recv(
 
     // bool exists = std::find(intVector.begin(), intVector.end(), data_size) != intVector.end();
 
-    if (!enc_stream) {
-        enc_stream = c10_npu::getCurrentNPUStream().stream();
-    }
+    const aclrtStream stream = getEncryptionStream();
 
     if (current_pos_recv + localSizePadding > element_count) {
         const uint32_t threadnum = AES_VEC_THREAD_NUM;
@@ -1500,8 +1710,8 @@ void aes_vec_encrypt_do_recv(
 
         at_npu::native::OpCommand cmd;
         cmd.Name("aes_vec_generate_mask");
-        cmd.SetCustomHandler([threadnum, deviceRoundKeys, base_ptr, element_count]() -> int {
-            aes_vec_generate_mask_impl(threadnum, enc_stream, deviceRoundKeys, base_ptr, base_ptr,
+        cmd.SetCustomHandler([stream, threadnum, deviceRoundKeys, base_ptr, element_count]() -> int {
+            aes_vec_generate_mask_impl(threadnum, stream, deviceRoundKeys, base_ptr, base_ptr,
                                        static_cast<uint32_t>(element_count));
             return 0;
         });
@@ -1515,8 +1725,8 @@ void aes_vec_encrypt_do_recv(
         cmd.Name("xor_do_unalign");
         void* input_ptr_ = (void*)(input_ptr + i * (data_size / tp_size));
         void* output_ptr_ = (void*)(output_ptr + i * (data_size / tp_size));
-        cmd.SetCustomHandler([key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
-            xor_do_unalign_impl(enc_stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
+        cmd.SetCustomHandler([stream, key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
+            xor_do_unalign_impl(stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
             return 0;
         });
         cmd.Run();
@@ -1526,6 +1736,124 @@ void aes_vec_encrypt_do_recv(
 
     return;
 }
+
+enum class AesCubeMode { Aligned, Batch, Unaligned, Send, Recv };
+
+void aesCubeCrypt(at::Tensor& keyStream, at::Tensor& input,
+                  at::Tensor& output, int64_t elementCount,
+                  bool isEncrypt, int64_t tpSize, AesCubeMode mode)
+{
+    TORCH_CHECK(tpSize > 0, "tp_size must be positive");
+    TORCH_CHECK(input.nbytes() == output.nbytes(),
+                "AES-Cube input/output byte sizes must match");
+    TORCH_CHECK(input.nbytes() % tpSize == 0,
+                "AES-Cube tensor bytes must be divisible by tp_size");
+    TORCH_CHECK(elementCount > 0 &&
+                elementCount <= std::numeric_limits<uint32_t>::max(),
+                "Invalid AES-Cube key-stream pool size: ", elementCount);
+    TORCH_CHECK(elementCount % AES_BLOCK_SIZE == 0,
+                "AES-Cube key-stream pool must be 16-byte aligned");
+    TORCH_CHECK(keyStream.nbytes() >= elementCount,
+                "AES-Cube key-stream tensor is smaller than element_count");
+
+    const aclrtStream stream = getEncryptionStream();
+
+    int64_t* position = &current_pos;
+    if (mode == AesCubeMode::Unaligned) position = &current_pos_unalign;
+    if (mode == AesCubeMode::Send) position = &current_pos_send;
+    if (mode == AesCubeMode::Recv) position = &current_pos_recv;
+    if (*position == -1) *position = elementCount;
+
+    const int64_t shardBytes = input.nbytes() / tpSize;
+    const bool unaligned = mode == AesCubeMode::Unaligned ||
+                           mode == AesCubeMode::Send ||
+                           mode == AesCubeMode::Recv;
+    const int64_t step = unaligned ? ((shardBytes + 31) / 32) * 32
+                                   : shardBytes;
+    TORCH_CHECK(step <= elementCount,
+                "One AES-Cube operation is larger than the key-stream pool");
+
+    auto* pool = reinterpret_cast<uint8_t*>(keyStream.data_ptr());
+    if (*position + step > elementCount) {
+        const auto& roundKeys = []() -> const std::array<uint8_t,
+                                                        AES128_RK_PAD_BYTES>& {
+            static const auto value = []() {
+                std::array<uint8_t, AES128_RK_BYTES> rk176{};
+                std::array<uint8_t, AES128_RK_PAD_BYTES> rk192{};
+                expandKey128(key, rk176.data());
+                padRoundKeys192(rk176.data(), rk192.data());
+                return rk192;
+            }();
+            return value;
+        }();
+
+        at_npu::native::OpCommand cmd;
+        cmd.Name("aes_cube_generate_mask");
+        cmd.SetCustomHandler([stream, pool, elementCount, &roundKeys]() -> int {
+            AesCubeResources::instance().generate(
+                stream, pool, static_cast<uint32_t>(elementCount),
+                roundKeys.data());
+            return 0;
+        });
+        cmd.Run();
+        *position = 0;
+    }
+
+    void* mask = pool + *position;
+    auto* inputPtr = reinterpret_cast<uint8_t*>(input.data_ptr());
+    auto* outputPtr = reinterpret_cast<uint8_t*>(output.data_ptr());
+    constexpr uint32_t workspaceSize = 4096;
+
+    if (mode == AesCubeMode::Batch) {
+        at_npu::native::OpCommand cmd;
+        cmd.Name("xor_do_batch");
+        cmd.SetCustomHandler([stream, mask, inputPtr, outputPtr, tpSize,
+                              bytes = input.nbytes()]() -> int {
+            xor_do_batch_impl(stream, mask, inputPtr, outputPtr,
+                              bytes, tpSize, workspaceSize);
+            return 0;
+        });
+        cmd.Run();
+    } else {
+        for (int64_t i = 0; i < tpSize; ++i) {
+            void* in = inputPtr + i * shardBytes;
+            void* out = outputPtr + i * shardBytes;
+            at_npu::native::OpCommand cmd;
+            cmd.Name(unaligned ? "xor_do_unalign" : "xor_do");
+            cmd.SetCustomHandler([stream, mask, in, out, shardBytes,
+                                  unaligned]() -> int {
+                if (unaligned) {
+                    xor_do_unalign_impl(stream, mask, in, out,
+                                        shardBytes, workspaceSize);
+                } else {
+                    xor_do_impl(stream, mask, in, out,
+                                shardBytes, workspaceSize);
+                }
+                return 0;
+            });
+            cmd.Run();
+        }
+    }
+
+    const bool alwaysAdvance = mode == AesCubeMode::Send ||
+                               mode == AesCubeMode::Recv;
+    if (alwaysAdvance || !isEncrypt) {
+        *position += step;
+    }
+}
+
+#define DEFINE_AES_CUBE_OP(name, mode)                                      \
+void name(at::Tensor& ks, at::Tensor& in, at::Tensor& out,                  \
+          int64_t count, bool enc, int64_t tpSize)                          \
+{ aesCubeCrypt(ks, in, out, count, enc, tpSize, mode); }
+
+DEFINE_AES_CUBE_OP(aes_cube_encrypt_do, AesCubeMode::Aligned)
+DEFINE_AES_CUBE_OP(aes_cube_encrypt_do_batch, AesCubeMode::Batch)
+DEFINE_AES_CUBE_OP(aes_cube_encrypt_do_unalign, AesCubeMode::Unaligned)
+DEFINE_AES_CUBE_OP(aes_cube_encrypt_do_send, AesCubeMode::Send)
+DEFINE_AES_CUBE_OP(aes_cube_encrypt_do_recv, AesCubeMode::Recv)
+
+#undef DEFINE_AES_CUBE_OP
 
 } // namespace vllm_ascend
 
@@ -1640,4 +1968,24 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.def(
         "aes_vec_encrypt_do_recv(Tensor! keystream, Tensor! input, Tensor! output, int element_count, bool is_enc, int tp_size) -> ()");
     ops.impl("aes_vec_encrypt_do_recv", torch::kPrivateUse1, &vllm_ascend::aes_vec_encrypt_do_recv);
+
+    ops.def("aes_cube_encrypt_do(Tensor! keystream, Tensor! input, Tensor! output, int element_count, bool is_enc, int tp_size) -> ()");
+    ops.impl("aes_cube_encrypt_do", torch::kPrivateUse1,
+            &vllm_ascend::aes_cube_encrypt_do);
+
+    ops.def("aes_cube_encrypt_do_batch(Tensor! keystream, Tensor! input, Tensor! output, int element_count, bool is_enc, int tp_size) -> ()");
+    ops.impl("aes_cube_encrypt_do_batch", torch::kPrivateUse1,
+            &vllm_ascend::aes_cube_encrypt_do_batch);
+
+    ops.def("aes_cube_encrypt_do_unalign(Tensor! keystream, Tensor! input, Tensor! output, int element_count, bool is_enc, int tp_size) -> ()");
+    ops.impl("aes_cube_encrypt_do_unalign", torch::kPrivateUse1,
+            &vllm_ascend::aes_cube_encrypt_do_unalign);
+
+    ops.def("aes_cube_encrypt_do_send(Tensor! keystream, Tensor! input, Tensor! output, int element_count, bool is_enc, int tp_size) -> ()");
+    ops.impl("aes_cube_encrypt_do_send", torch::kPrivateUse1,
+            &vllm_ascend::aes_cube_encrypt_do_send);
+
+    ops.def("aes_cube_encrypt_do_recv(Tensor! keystream, Tensor! input, Tensor! output, int element_count, bool is_enc, int tp_size) -> ()");
+    ops.impl("aes_cube_encrypt_do_recv", torch::kPrivateUse1,
+            &vllm_ascend::aes_cube_encrypt_do_recv);
 }

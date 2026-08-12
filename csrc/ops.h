@@ -206,4 +206,22 @@ namespace vllm_ascend {
         void* input,
         void* output,
         uint32_t dataSize);
+
+    extern void aes_cube_generate_mask_impl(
+        uint32_t blockDim, 
+        void *stream,
+        void *roundKeysPadded48, 
+        void *input, 
+        void *output,
+        void *te0, 
+        void *te1, 
+        void *te2, 
+        void *te3, 
+        void *sbox,
+        void *b_workspace, 
+        void *c_workspace, 
+        void *workspace,
+        void *tiling, 
+        uint32_t nounce, 
+        uint32_t dataSize);
 }
