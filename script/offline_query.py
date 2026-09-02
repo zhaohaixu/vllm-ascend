@@ -10,6 +10,7 @@ from vllm import LLM, SamplingParams
 # os.environ["VLLM_TORCH_PROFILER_WITH_STACK"] = "0"
 # os.environ["VLLM_ENC_DYNAMIC_STREAM"] = "1"
 os.environ["VLLM_ENC_ENABLE"] = "chacha20-naive"
+os.environ["TORCH_ENC_ENABLE"] = "chacha20-naive"
 
 # Sample prompts.
 prompts = [

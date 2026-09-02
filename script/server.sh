@@ -9,6 +9,7 @@ rm -rf /root/.cache/vllm/torch_compile_cache/*
 # export LD_LIBRARY_PATH=/usr/local/python3.11.13/lib/python3.11/site-packages/torch_npu/lib:$LD_LIBRARY_PATH
 
 # VLLM_ENC_DYNAMIC_STREAM=1 \
+TORCH_ENC_ENABLE=chacha20-naive \
 VLLM_ENC_ENABLE=chacha20-naive \
 ASCEND_RT_VISIBLE_DEVICES=2,3,4,5 vllm serve /mnt/Qwen3-8B-W8A8 --served-model-name "Qwen3-8B-W8A8" \
     --max-model-len 4096 \
