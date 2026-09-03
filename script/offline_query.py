@@ -9,7 +9,7 @@ from vllm import LLM, SamplingParams
 # os.environ["VLLM_TORCH_PROFILER_DIR"] = "./vllm_profile"
 # os.environ["VLLM_TORCH_PROFILER_WITH_STACK"] = "0"
 # os.environ["VLLM_ENC_DYNAMIC_STREAM"] = "1"
-os.environ["VLLM_ENC_ENABLE"] = "chacha20-naive"
+os.environ["VLLM_ENC_ENABLE"] = "sm4-vec"
 
 # Sample prompts.
 prompts = [
@@ -21,7 +21,7 @@ sampling_params = SamplingParams(max_tokens=128, temperature=0.8, top_p=0.95)
 
 def main():
     # Create an LLM.
-    llm = LLM(model="/mnt/Qwen3-8B-W8A8",
+    llm = LLM(model="/mnt/model/Qwen3-8B-W8A8",
               tensor_parallel_size=2,
               pipeline_parallel_size=1,
               trust_remote_code=True,
