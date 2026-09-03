@@ -224,4 +224,42 @@ namespace vllm_ascend {
         void *tiling, 
         uint32_t nounce, 
         uint32_t dataSize);
+
+    extern void morus_encrypt_do_impl(
+        int64_t threadnum, 
+        void* enc_stream, 
+        uint16_t* input_aligned_ptr, 
+        uint16_t* key_nounce_ptr,
+        uint16_t* output_aligned_ptr, 
+        int64_t m_batch_size);
+         
+    extern void ascen_keystream_impl(
+        uint32_t blockDim,
+        void *stream,
+        void* keynonce,
+        void* keystream,
+        uint32_t keystream_size);
+
+    extern void ascen_encrypt_impl(
+        int64_t threadnum,
+        void *stream,
+        void* plaintext,
+        void* keystream,
+        void* ciphertext,
+        uint32_t input_size);
+
+    extern void ascen_decrypt_impl(
+        int64_t threadnum,
+        void *stream,
+        void* plaintext,
+        void* keystream,
+        void* ciphertext,
+        uint32_t input_size);
+    extern void sm4_ctr_encrypt_do_impl(
+        uint32_t blockDim,
+        void* stream,
+        void* roundKeys128,
+        void* input,
+        void* output,
+        uint32_t dataSize);
 }

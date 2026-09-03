@@ -8,7 +8,7 @@ evalscope perf \
   --min-tokens 2048 \
   --api openai \
   --dataset random \
-  --tokenizer-path /mnt/Qwen3-8B-W8A8 \
+  --tokenizer-path /mnt/model/Qwen3-8B-W8A8 \
   --debug \
   --max-prompt-length 512 \
   --min-prompt-length 512 \
