@@ -1,0 +1,1978 @@
+diff --git a/csrc/kernels/ascen.cpp b/csrc/kernels/ascen.cpp
+new file mode 100644
+index 000000000..c9c7aa9bd
+--- /dev/null
++++ b/csrc/kernels/ascen.cpp
+@@ -0,0 +1,253 @@
++/**
++ * @file ascen.cpp
++ *
++ * Copyright (C) 2024. Huawei Technologies Co., Ltd. All rights reserved.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
++ */
++#include "kernel_operator.h"
++
++//#define M_BATCH_SIZE 4000
++#define STATE_BATCH_SIZE 640
++
++class KernelAdd {
++public:
++    __aicore__ inline KernelAdd() {}
++    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, GM_ADDR z, size_t m_batch_size) {
++        xGm.SetGlobalBuffer((__gm__ uint16_t *)x + AscendC::GetBlockIdx() * 8 * STATE_BATCH_SIZE, 8 * STATE_BATCH_SIZE);
++        yGm.SetGlobalBuffer((__gm__ uint16_t *)y + 16 * STATE_BATCH_SIZE *  AscendC::GetBlockIdx(), 8 * STATE_BATCH_SIZE + 8 * STATE_BATCH_SIZE);
++        zGm.SetGlobalBuffer((__gm__ uint16_t *)z + AscendC::GetBlockIdx() * 8 * STATE_BATCH_SIZE, 8 * STATE_BATCH_SIZE);
++        pipe.InitBuffer(inQueueX, 1, 8 * STATE_BATCH_SIZE * sizeof(uint16_t));
++        pipe.InitBuffer(inQueueY, 1, 8 * STATE_BATCH_SIZE * sizeof(uint16_t) * 2);
++        pipe.InitBuffer(outQueueZ, 1, 8 * STATE_BATCH_SIZE * sizeof(uint16_t));
++        pipe.InitBuffer(updateBuffer, 8 * STATE_BATCH_SIZE * sizeof(uint16_t) * 4);
++        pipe.InitBuffer(statesBuffer, 8 * STATE_BATCH_SIZE * sizeof(uint16_t) * 5);
++        pipe.InitBuffer(initBuffer, 8 * STATE_BATCH_SIZE * sizeof(uint16_t) * 2);
++    }
++    __aicore__ inline void Process(int m_batch_size) {
++        for (int i = 0; i < m_batch_size; i++) {
++            CopyIn(i);
++            Compute(i);
++            CopyOut(i);
++        }
++        
++    }
++
++private:
++    __aicore__ inline void CopyIn(int progress) {
++        AscendC::LocalTensor<uint16_t> xLocal = inQueueX.AllocTensor<uint16_t>();
++        AscendC::LocalTensor<uint16_t> yLocal = inQueueY.AllocTensor<uint16_t>(); // iv + key
++        AscendC::DataCopy(xLocal, xGm[8 * STATE_BATCH_SIZE * progress], 8 * STATE_BATCH_SIZE);
++        AscendC::DataCopy(yLocal, yGm, 8 * STATE_BATCH_SIZE * 2);
++        inQueueX.EnQue(xLocal);
++        inQueueY.EnQue(yLocal);
++    }
++    __aicore__ inline void Compute(int progress) {
++        AscendC::LocalTensor<uint16_t> xLocal = inQueueX.DeQue<uint16_t>();
++        AscendC::LocalTensor<uint16_t> yLocal = inQueueY.DeQue<uint16_t>();
++        AscendC::LocalTensor<uint16_t> zLocal = outQueueZ.AllocTensor<uint16_t>();
++        AscendC::LocalTensor<uint16_t> states = statesBuffer.Get<uint16_t>();
++
++        if (progress == 0) {
++        Initialization(states, yLocal, yLocal[8 * STATE_BATCH_SIZE]);
++        }
++        Encryption(states, xLocal, zLocal);
++        
++        //Finalization(states, yLocal, zLocal);
++
++        outQueueZ.EnQue<uint16_t>(zLocal);
++        inQueueX.FreeTensor(xLocal);
++        inQueueY.FreeTensor(yLocal);
++
++    }
++    __aicore__ inline void CopyOut(int progress) {
++        AscendC::LocalTensor<uint16_t> zLocal = outQueueZ.DeQue<uint16_t>();
++        AscendC::DataCopy(zGm[8 * STATE_BATCH_SIZE * progress], zLocal, 8 * STATE_BATCH_SIZE);
++        outQueueZ.FreeTensor(zLocal);
++    }
++    __aicore__ inline void StateUpdate(AscendC::LocalTensor<uint16_t> &states, const AscendC::LocalTensor<uint16_t> &p) {
++        int32_t state_size = STATE_BATCH_SIZE * 8, shift_const = 2;
++        AscendC::LocalTensor<int16_t> i16states = states.ReinterpretCast<int16_t>();
++        AscendC::LocalTensor<int16_t> i16p = p.ReinterpretCast<int16_t>();
++        AscendC::LocalTensor<uint16_t> cache = updateBuffer.Get<uint16_t>();
++        AscendC::LocalTensor<int16_t> i16cache = cache.ReinterpretCast<int16_t>();
++        // Round 1
++        AscendC::And(cache, states[1 * state_size], states[2 * state_size], state_size); // s1 & s2
++        AscendC::Add(i16cache, i16cache, i16states[0 * state_size], state_size); // s0 + (s1 & s2)
++        AscendC::Add(i16cache, i16cache, i16states[3 * state_size], state_size); // s0 + (s1 & s2) + s3
++
++        AscendC::ShiftLeft(states[0 * state_size], cache, (uint16_t) 5, state_size); // (s0 + (s1 & s2) + s3) << 5
++        AscendC::ShiftRight(cache, cache, (uint16_t) 11, state_size); // (s0 + (s1 & s2) + s3) >> 11
++        AscendC::Or(states[0 * state_size], states[0 * state_size], cache, state_size); // (s0 + (s1 & s2) + s3) <<< 5
++
++        AscendC::DataCopy(cache, states[3 * state_size], shift_const * STATE_BATCH_SIZE);
++        AscendC::DataCopy(states[3 * state_size], states[3 * state_size + shift_const * STATE_BATCH_SIZE], (8 - shift_const) * STATE_BATCH_SIZE);
++        AscendC::DataCopy(states[3 * state_size + (8 - shift_const) * STATE_BATCH_SIZE], cache, shift_const * STATE_BATCH_SIZE); // rotate 32
++        // Round 2
++        shift_const = 4;
++        AscendC::And(cache, states[2 * state_size], states[3 * state_size], state_size); // s2 & s3
++        AscendC::Add(i16cache, i16cache, i16states[1 * state_size], state_size); // s1 + (s2 & s3)
++        AscendC::Xor(cache[state_size], cache, states[4 * state_size], state_size); // s1 + (s2 & s3) ^ s4
++        AscendC::Add(i16cache, i16cache[state_size], i16p, state_size); // s1 + (s2 & s3) ^ s4 + p
++
++        AscendC::ShiftLeft(states[1 * state_size], cache, (uint16_t) 15, state_size); // (s1 + (s2 & s3) ^ s4 + p) << 15
++        AscendC::ShiftRight(cache, cache, (uint16_t) 1, state_size); // (s1 + (s2 & s3) ^ s4 + p) >> 1
++        AscendC::Or(states[1 * state_size], states[1 * state_size], cache, state_size); // (s1 + (s2 & s3) ^ s4 + p) <<< 15
++
++        AscendC::DataCopy(cache, states[4 * state_size], shift_const * STATE_BATCH_SIZE);
++        AscendC::DataCopy(states[4 * state_size], states[4 * state_size + shift_const * STATE_BATCH_SIZE], (8 - shift_const) * STATE_BATCH_SIZE);
++        AscendC::DataCopy(states[4 * state_size + (8 - shift_const) * STATE_BATCH_SIZE], cache, shift_const * STATE_BATCH_SIZE); // rotate 64
++
++        // Round 3
++        shift_const = 6;
++        AscendC::And(cache, states[3 * state_size], states[4 * state_size], state_size); // s3 & s4
++        AscendC::Add(i16cache, i16cache, i16states[2 * state_size], state_size); // s2 + (s3 & s4)
++        AscendC::Xor(cache[state_size], cache, states[0 * state_size], state_size); // s2 + (s3 & s4) ^ s0
++        AscendC::Add(i16cache, i16cache[state_size], i16p, state_size); // s2 + (s3 & s4) ^ s0 + p
++
++        AscendC::ShiftLeft(states[2 * state_size], cache, (uint16_t) 7, state_size); // (s2 + (s3 & s4) ^ s0 + p) << 7
++        AscendC::ShiftRight(cache, cache, (uint16_t) 9, state_size); // (s2 + (s3 & s4) ^ s0 + p) >> 9
++        AscendC::Or(states[2 * state_size], states[2 * state_size], cache, state_size); // (s2 + (s3 & s4) ^ s0 + p) <<< 7
++
++        AscendC::DataCopy(cache, states[0 * state_size + shift_const * STATE_BATCH_SIZE], (8 - shift_const) * STATE_BATCH_SIZE);
++        AscendC::DataCopy(states[0 * state_size + (8 - shift_const) * STATE_BATCH_SIZE], states[0 * state_size], shift_const * STATE_BATCH_SIZE);
++        AscendC::DataCopy(states[0 * state_size], cache, (8 - shift_const) * STATE_BATCH_SIZE); // rotate 96
++
++        // Round 4
++        shift_const = 4;
++        AscendC::And(cache, states[4 * state_size], states[0 * state_size], state_size); // s4 & s0
++        AscendC::Add(i16cache, i16cache, i16states[3 * state_size], state_size); // s3 + (s4 & s0)
++        AscendC::Add(i16cache[state_size], i16cache, i16states[1 * state_size], state_size); // s3 + (s4 & s0) + s1
++        AscendC::Add(i16cache, i16cache[state_size], i16p, state_size); // s3 + (s4 & s0) + s1 + p
++
++        AscendC::ShiftLeft(states[3 * state_size], cache, (uint16_t) 8, state_size); // (s3 + (s4 & s0) + s1 + p) << 8
++        AscendC::ShiftRight(cache, cache, (uint16_t) 8, state_size); // (s3 + (s4 & s0) + s1 + p) >> 8
++        AscendC::Or(states[3 * state_size], states[3 * state_size], cache, state_size); // (s3 + (s4 & s0) + s1 + p) <<< 8
++
++        AscendC::DataCopy(cache, states[1 * state_size], shift_const * STATE_BATCH_SIZE);
++        AscendC::DataCopy(states[1 * state_size], states[1 * state_size + shift_const * STATE_BATCH_SIZE], (8 - shift_const) * STATE_BATCH_SIZE);
++        AscendC::DataCopy(states[1 * state_size + (8 - shift_const) * STATE_BATCH_SIZE], cache, shift_const * STATE_BATCH_SIZE); // rotate 64
++
++        // Round 5
++        shift_const = 2;
++        AscendC::And(cache, states[0 * state_size], states[1* state_size], state_size); // s0 & s1
++        AscendC::Add(i16cache, i16cache, i16states[4 * state_size], state_size); // s4 + (s0 & s1)
++        AscendC::Add(i16cache[state_size], i16cache, i16states[2 * state_size], state_size); // s4 + (s0 & s1) + s2
++        AscendC::Add(i16cache, i16cache[state_size], i16p, state_size); // s4 + (s0 & s1) + s2 + p
++
++        AscendC::ShiftLeft(states[4 * state_size], cache, (uint16_t) 13, state_size); // (s4 + (s0 & s1) + s2 + p) << 13
++        AscendC::ShiftRight(cache, cache, (uint16_t) 3, state_size); // (s4 + (s0 & s1) + s2 + p) >> 13
++        AscendC::Or(states[4 * state_size], states[4 * state_size], cache, state_size); // (s4 + (s0 & s1) + s2 + p) <<< 13
++
++        AscendC::DataCopy(cache, states[2 * state_size], shift_const * STATE_BATCH_SIZE);
++        AscendC::DataCopy(states[2 * state_size], states[2 * state_size + shift_const * STATE_BATCH_SIZE], (8 - shift_const) * STATE_BATCH_SIZE);
++        AscendC::DataCopy(states[2 * state_size + (8 - shift_const) * STATE_BATCH_SIZE], cache, shift_const * STATE_BATCH_SIZE); // rotate 32
++    }
++    __aicore__ inline void Initialization(AscendC::LocalTensor<uint16_t> &states, const AscendC::LocalTensor<uint16_t> &ivs, const AscendC::LocalTensor<uint16_t> &keys) {
++        int32_t state_size = STATE_BATCH_SIZE * 8;
++        AscendC::LocalTensor<uint16_t> cache = initBuffer.Get<uint16_t>();
++        AscendC::LocalTensor<int16_t> i16states = states.ReinterpretCast<int16_t>();
++        AscendC::LocalTensor<int16_t> i16keys = keys.ReinterpretCast<int16_t>();
++        AscendC::DataCopy(states[0 * state_size], ivs, state_size); // s0 = iv
++        AscendC::DataCopy(states[1 * state_size], keys, state_size); // s1 = k
++        AscendC::Duplicate(states[2 * state_size], (uint16_t) 0xFFFF, state_size); // s2 = 1^128
++
++        AscendC::Duplicate(states[3 * state_size + 0 * STATE_BATCH_SIZE], (uint16_t) 0x1, STATE_BATCH_SIZE);
++        AscendC::Duplicate(states[3 * state_size + 1 * STATE_BATCH_SIZE], (uint16_t) 0x2, STATE_BATCH_SIZE);
++        AscendC::Duplicate(states[3 * state_size + 2 * STATE_BATCH_SIZE], (uint16_t) 0x3, STATE_BATCH_SIZE);
++        AscendC::Duplicate(states[3 * state_size + 3 * STATE_BATCH_SIZE], (uint16_t) 0x4, STATE_BATCH_SIZE);
++        AscendC::Duplicate(states[3 * state_size + 4 * STATE_BATCH_SIZE], (uint16_t) 0x5, STATE_BATCH_SIZE);
++        AscendC::Duplicate(states[3 * state_size + 5 * STATE_BATCH_SIZE], (uint16_t) 0x6, STATE_BATCH_SIZE);
++        AscendC::Duplicate(states[3 * state_size + 6 * STATE_BATCH_SIZE], (uint16_t) 0x7, STATE_BATCH_SIZE);
++        AscendC::Duplicate(states[3 * state_size + 7 * STATE_BATCH_SIZE], (uint16_t) 0x8, STATE_BATCH_SIZE); // s3 = const0
++        AscendC::DataCopy(cache, states[3 * state_size], state_size); // const0 backup
++
++        AscendC::Duplicate(states[4 * state_size + 0 * STATE_BATCH_SIZE], (uint16_t) 0x2, STATE_BATCH_SIZE);
++        AscendC::Duplicate(states[4 * state_size + 1 * STATE_BATCH_SIZE], (uint16_t) 0x3, STATE_BATCH_SIZE);
++        AscendC::Duplicate(states[4 * state_size + 2 * STATE_BATCH_SIZE], (uint16_t) 0x4, STATE_BATCH_SIZE);
++        AscendC::Duplicate(states[4 * state_size + 3 * STATE_BATCH_SIZE], (uint16_t) 0x5, STATE_BATCH_SIZE);
++        AscendC::Duplicate(states[4 * state_size + 4 * STATE_BATCH_SIZE], (uint16_t) 0x6, STATE_BATCH_SIZE);
++        AscendC::Duplicate(states[4 * state_size + 5 * STATE_BATCH_SIZE], (uint16_t) 0x7, STATE_BATCH_SIZE);
++        AscendC::Duplicate(states[4 * state_size + 6 * STATE_BATCH_SIZE], (uint16_t) 0x8, STATE_BATCH_SIZE);
++        AscendC::Duplicate(states[4 * state_size + 7 * STATE_BATCH_SIZE], (uint16_t) 0x9, STATE_BATCH_SIZE); // s4 = const1
++
++        for (int i = 0; i < 16; i++) {
++            StateUpdate(states, cache);
++        }
++
++        AscendC::Add(i16states[1 * state_size], i16states[1 * state_size], i16keys, state_size); // s1 += k
++    }
++    __aicore__ inline void Encryption(AscendC::LocalTensor<uint16_t> &states, AscendC::LocalTensor<uint16_t> m, AscendC::LocalTensor<uint16_t> c) {
++        int32_t shift_const = 1, state_size = STATE_BATCH_SIZE * 8;
++        AscendC::LocalTensor<uint16_t> cache = initBuffer.Get<uint16_t>();
++        AscendC::LocalTensor<int16_t> i16cache = cache.ReinterpretCast<int16_t>();
++        AscendC::LocalTensor<int16_t> i16c = c.ReinterpretCast<int16_t>();
++        AscendC::LocalTensor<int16_t> i16m = m.ReinterpretCast<int16_t>();
++        AscendC::DataCopy(cache[0 * state_size + (8 - shift_const) * STATE_BATCH_SIZE], states[0 * state_size], shift_const * STATE_BATCH_SIZE);
++        AscendC::DataCopy(cache[0 * state_size], states[0 * state_size + shift_const * STATE_BATCH_SIZE], (8 - shift_const) * STATE_BATCH_SIZE); // s0 <<< 5
++
++        shift_const = 6;
++        AscendC::DataCopy(cache[1 * state_size + (8 - shift_const) * STATE_BATCH_SIZE], states[0 * state_size], shift_const * STATE_BATCH_SIZE);
++        AscendC::DataCopy(cache[1 * state_size], states[0 * state_size + shift_const * STATE_BATCH_SIZE], (8 - shift_const) * STATE_BATCH_SIZE); // s1 <<< 96
++
++        AscendC::Add(i16cache[0 * state_size], i16cache[0 * state_size], i16cache[1 * state_size], state_size); // s0 <<< 5 + s1 <<< 96
++        AscendC::And(cache[1 * state_size], states[2 * state_size], states[3 * state_size], state_size); // s2 & s3
++        AscendC::Add(i16cache[0 * state_size], i16cache[0 * state_size], i16cache[1 * state_size], state_size); // s0 <<< 5 + s1 <<< 96 + (s2 & s3)
++        AscendC::Add(i16c, i16m, i16cache[0 * state_size], state_size); // c = m + s0 <<< 5 + s1 <<< 96 + (s2 & s3)
++
++        StateUpdate(states, m);
++    }
++    __aicore__ inline void Finalization(AscendC::LocalTensor<uint16_t> &states, const AscendC::LocalTensor<uint16_t> &lengths, const AscendC::LocalTensor<uint16_t> &tags) {
++        int32_t shift_const = 6, state_size = STATE_BATCH_SIZE * 8;
++        AscendC::LocalTensor<uint16_t> cache = initBuffer.Get<uint16_t>();
++        AscendC::LocalTensor<int16_t> i16cache = cache.ReinterpretCast<int16_t>();
++        AscendC::LocalTensor<int16_t> i16states = states.ReinterpretCast<int16_t>();
++        AscendC::LocalTensor<int16_t> i16tags = tags.ReinterpretCast<int16_t>();
++
++        for (int i = 0; i < 10; i++) {
++            StateUpdate(states, lengths);
++        }
++
++        AscendC::DataCopy(cache[0 * state_size + (8 - shift_const) * STATE_BATCH_SIZE], states[0 * state_size], shift_const * STATE_BATCH_SIZE);
++        AscendC::DataCopy(cache[0 * state_size], states[0 * state_size + shift_const * STATE_BATCH_SIZE], (8 - shift_const) * STATE_BATCH_SIZE); // s1 <<< 96
++
++        AscendC::Add(i16cache[0 * state_size], i16cache[0 * state_size], i16states[0 * state_size], state_size); // s0 + s1 <<< 96
++        AscendC::And(cache[1 * state_size], states[2 * state_size], states[3 * state_size], state_size); // s2 & s3
++        AscendC::Add(i16tags, i16cache[0 * state_size], i16cache[1 * state_size], state_size); // tag = s0 + s1 <<< 96 + (s2 & s3)
++    }
++    AscendC::TPipe pipe;
++    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueX, inQueueY;
++    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueZ;
++    AscendC::GlobalTensor<uint16_t> xGm;
++    AscendC::GlobalTensor<uint16_t> yGm;
++    AscendC::GlobalTensor<uint16_t> zGm;
++    AscendC::TBuf<AscendC::TPosition::VECCALC> updateBuffer, statesBuffer, initBuffer;
++};
++
++//  extern "C" __global__ __aicore__ void ascen(GM_ADDR x, GM_ADDR y, GM_ADDR z, size_t m_batch_size)
++extern "C" __global__ __aicore__ void ascen(
++     __gm__ uint8_t* x, 
++     __gm__ uint8_t* y, 
++     __gm__ uint8_t* z, 
++    size_t m_batch_size)
++{
++    KernelAdd op;
++    op.Init(x, y, z, m_batch_size);
++    op.Process(m_batch_size);
++}
++
++namespace vllm_ascend {
++    
++extern void morus_encrypt_do_impl(int64_t threadnum, void* enc_stream, uint16_t* input_aligned_ptr, uint16_t* key_nounce_ptr, uint16_t* output_aligned_ptr, int64_t m_batch_size)
++{
++    ascen<<<threadnum, nullptr, enc_stream>>>(
++        input_aligned_ptr,
++        key_nounce_ptr,
++        output_aligned_ptr,
++        m_batch_size);
++}
++} //namespace vllm_ascend
++
++ 
+\ No newline at end of file
+diff --git a/csrc/kernels/ascen2.cpp b/csrc/kernels/ascen2.cpp
+new file mode 100644
+index 000000000..09a6658e7
+--- /dev/null
++++ b/csrc/kernels/ascen2.cpp
+@@ -0,0 +1,406 @@
++/**
++ * @file ascen.cpp
++ *
++ * Copyright (C) 2024. Huawei Technologies Co., Ltd. All rights reserved.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
++ */
++#include "kernel_operator.h"
++//#define M_BATCH_SIZE 100
++#define STATE_BATCH_SIZE 384
++#define EXE_TIME 1
++
++class KernelAdd {
++public:
++    __aicore__ inline KernelAdd() {}
++    __aicore__ inline void Init(GM_ADDR y, GM_ADDR z, size_t keystream_size) {
++        size_t M_BATCH_SIZE = keystream_size / (32 * STATE_BATCH_SIZE);
++        yGm.SetGlobalBuffer((__gm__ uint16_t *)y + 24 * STATE_BATCH_SIZE *  AscendC::GetBlockIdx(), 24 * STATE_BATCH_SIZE);
++        zGm.SetGlobalBuffer((__gm__ uint16_t *)z + AscendC::GetBlockIdx() * 32 * STATE_BATCH_SIZE * M_BATCH_SIZE, 32 * STATE_BATCH_SIZE * M_BATCH_SIZE);
++        pipe.InitBuffer(inQueueY, 1, 57 * STATE_BATCH_SIZE * sizeof(uint16_t) );
++        pipe.InitBuffer(outQueueZ, 1, 32 * STATE_BATCH_SIZE * sizeof(uint16_t));
++        pipe.InitBuffer(updateBuffer, 10 * STATE_BATCH_SIZE * sizeof(uint16_t));
++        pipe.InitBuffer(keyBuffer, 16 * STATE_BATCH_SIZE * sizeof(uint16_t));
++        //pipe.InitBuffer(initBuffer, 10* STATE_BATCH_SIZE * sizeof(uint16_t));
++    }
++    
++    __aicore__ inline void Process(int keystream_size) {
++        int m_batch_size = keystream_size / (32 * STATE_BATCH_SIZE);
++        for (int r=0; r < m_batch_size; r++){
++            CopyIn(r);
++            Compute(r, m_batch_size);          
++            CopyOut(r);
++        }
++    }
++    
++private:
++    
++    __aicore__ inline void CopyIn(int progress) {
++        if(progress ==0){
++        AscendC::LocalTensor<uint16_t> yLocal = inQueueY.AllocTensor<uint16_t>();
++        AscendC::DataCopy(yLocal, yGm, 8 * STATE_BATCH_SIZE * 3);
++         inQueueY.EnQue(yLocal);
++        }
++    }
++    __aicore__ inline void Compute(int progress, int m_batch_size) {
++        AscendC::LocalTensor<uint16_t> yLocal = inQueueY.DeQue<uint16_t>();
++        AscendC::LocalTensor<uint16_t> key = keyBuffer.Get<uint16_t>();
++        
++       if(progress ==0){
++        Initialization(key, yLocal);
++       }
++        // inQueueY.FreeTensor(yLocal);
++        AscendC::LocalTensor<uint16_t> zLocal = outQueueZ.AllocTensor<uint16_t>();
++        // yLocal = inQueueY.AllocTensor<uint16_t>();
++        //AscendC::LocalTensor<uint16_t> states = statesBuffer.Get<uint16_t>();
++        //AscendC::DataCopy(xLocal, xGm[progress * 32 * STATE_BATCH_SIZE], 32 * STATE_BATCH_SIZE);
++        //Initialization(states, yLocal, yLocal[8 * STATE_BATCH_SIZE]);
++        Encryption(yLocal, zLocal);
++
++        outQueueZ.EnQue<uint16_t>(zLocal);
++        if(progress< m_batch_size-1){
++            inQueueY.EnQue(yLocal);
++        }
++        else{
++            inQueueY.FreeTensor(yLocal);
++        }
++    }
++    __aicore__ inline void CopyOut(int progress) {
++        AscendC::LocalTensor<uint16_t> zLocal = outQueueZ.DeQue<uint16_t>();
++       
++        AscendC::DataCopy(zGm[32 * STATE_BATCH_SIZE* progress], zLocal, 32 * STATE_BATCH_SIZE);
++        outQueueZ.FreeTensor(zLocal);
++    }
++
++    __aicore__ inline void Batch_StateUpdate(AscendC::LocalTensor<uint16_t> states, const size_t batch) {
++        int32_t state_size = STATE_BATCH_SIZE, shift_const = 2;
++        AscendC::LocalTensor<int16_t> i16states = states.ReinterpretCast<int16_t>();
++        AscendC::LocalTensor<uint16_t> cache = updateBuffer.Get<uint16_t>();
++        AscendC::LocalTensor<int16_t> i16cache = cache.ReinterpretCast<int16_t>();
++        // Round 1
++        AscendC::Mul(i16states[37*STATE_BATCH_SIZE], i16states[((25)) * state_size], i16states[((15)) * state_size], batch*state_size);
++        AscendC::ShiftLeft(cache, states[((25)) * state_size], (uint16_t) 8, batch*state_size);
++        AscendC::ShiftRight(states[((25)) * state_size], states[((25)) * state_size], (uint16_t) 8, batch*state_size);
++        AscendC::Add(i16states[((25)) * state_size], i16states[((25)) * state_size], i16cache, batch*state_size);
++        AscendC::Add(i16states[37*STATE_BATCH_SIZE], i16states[37*STATE_BATCH_SIZE], i16states[((0)) * state_size], batch*state_size);
++        AscendC::Add(i16states[37*STATE_BATCH_SIZE], i16states[37*STATE_BATCH_SIZE], i16states[((22)) * state_size], batch*state_size);
++        AscendC::Or(cache, states[((17)) * state_size], states[((2)) * state_size], batch*state_size);
++        AscendC::Add(i16states[((37)) * state_size], i16cache, i16states[((37)) * state_size], batch*state_size);
++
++    }
++    __aicore__ inline void Initialization(AscendC::LocalTensor<uint16_t> keys, AscendC::LocalTensor<uint16_t> states) {
++        int32_t state_size = STATE_BATCH_SIZE * 8;
++        //AscendC::LocalTensor<uint16_t> cache = initBuffer.Get<uint16_t>();
++        AscendC::LocalTensor<int16_t> i16states = states.ReinterpretCast<int16_t>();
++        AscendC::LocalTensor<int16_t> i16keys = keys.ReinterpretCast<int16_t>();
++        // AscendC::DataCopy(states[0 * state_size], ivs, state_size); // s0 = iv
++        AscendC::DataCopy( keys,states[1 * state_size], 2 * state_size); // s1 = k
++        //AscendC::Duplicate(states[2 * state_size], (uint16_t) 0xFFFF, state_size); // s2 = 1^128
++
++        AscendC::Duplicate(states[3 * state_size + 0 * STATE_BATCH_SIZE], (uint16_t) 0x1, STATE_BATCH_SIZE);
++        AscendC::Duplicate(states[3 * state_size + 1 * STATE_BATCH_SIZE], (uint16_t) 0x2, STATE_BATCH_SIZE);
++        AscendC::Duplicate(states[3 * state_size + 2 * STATE_BATCH_SIZE], (uint16_t) 0x3, STATE_BATCH_SIZE);
++        AscendC::Duplicate(states[3 * state_size + 3 * STATE_BATCH_SIZE], (uint16_t) 0x4, STATE_BATCH_SIZE);
++        AscendC::Duplicate(states[3 * state_size + 4 * STATE_BATCH_SIZE], (uint16_t) 0x5, STATE_BATCH_SIZE);
++        AscendC::Duplicate(states[3 * state_size + 5 * STATE_BATCH_SIZE], (uint16_t) 0x6, STATE_BATCH_SIZE);
++        AscendC::Duplicate(states[3 * state_size + 6 * STATE_BATCH_SIZE], (uint16_t) 0x7, STATE_BATCH_SIZE);
++        AscendC::Duplicate(states[3 * state_size + 7 * STATE_BATCH_SIZE], (uint16_t) 0x8, STATE_BATCH_SIZE); // s3 = const0
++        //AscendC::DataCopy(cache, states[3 * state_size], state_size); // const0 backup
++
++        AscendC::Duplicate(states[3 * state_size + 8 * STATE_BATCH_SIZE], (uint16_t) 0x2, STATE_BATCH_SIZE);
++        AscendC::Duplicate(states[3 * state_size + 9 * STATE_BATCH_SIZE], (uint16_t) 0x3, STATE_BATCH_SIZE);
++        AscendC::Duplicate(states[3 * state_size + 10 * STATE_BATCH_SIZE], (uint16_t) 0x4, STATE_BATCH_SIZE);
++        AscendC::Duplicate(states[3 * state_size + 11 * STATE_BATCH_SIZE], (uint16_t) 0x5, STATE_BATCH_SIZE);
++        AscendC::Duplicate(states[3 * state_size + 12 * STATE_BATCH_SIZE], (uint16_t) 0x6, STATE_BATCH_SIZE);
++
++        for(int i=0 ; i<3; i++){
++        Batch_StateUpdate(states,10);
++        
++        Batch_StateUpdate(states[10*STATE_BATCH_SIZE],10);
++        AscendC::DataCopy(states, states[20* STATE_BATCH_SIZE], 37*STATE_BATCH_SIZE);
++        
++        Batch_StateUpdate(states,10);
++        
++        Batch_StateUpdate(states[10*STATE_BATCH_SIZE],7);
++        AscendC::DataCopy(states, states[17* STATE_BATCH_SIZE], 37*STATE_BATCH_SIZE);
++    
++        }
++        
++
++        
++        //Key feed-forward: S[0-8]+=k1, S[12-27] += k0||k1, S[29-36] += k0
++        AscendC::Add(i16states[0 * state_size], i16states[0 * state_size], i16keys[1*state_size], state_size); // s1 += k
++        AscendC::Add(i16states[1 * state_size + 4 * STATE_BATCH_SIZE], i16states[1 * state_size + 4 * STATE_BATCH_SIZE], i16keys, 2 * state_size);
++        AscendC::Add(i16states[3 * state_size + 5 * STATE_BATCH_SIZE], i16states[3 * state_size + 5 * STATE_BATCH_SIZE], i16keys[0*state_size], state_size);
++    } 
++    __aicore__ inline void Encryption(AscendC::LocalTensor<uint16_t> states, AscendC::LocalTensor<uint16_t> c) {
++        int state_size = STATE_BATCH_SIZE;
++        AscendC::LocalTensor<int16_t> i16states = states.ReinterpretCast<int16_t>();
++        AscendC::LocalTensor<uint16_t> cache = keyBuffer.Get<uint16_t>();
++        AscendC::LocalTensor<int16_t> i16cache = cache.ReinterpretCast<int16_t>();
++        AscendC::LocalTensor<int16_t> i16c = c.ReinterpretCast<int16_t>();
++       
++        //i=1
++        AscendC::Add(i16cache, i16states[((1)) * STATE_BATCH_SIZE], i16states[((18)) * STATE_BATCH_SIZE], 4*STATE_BATCH_SIZE);
++        AscendC::Add(i16cache, i16cache, i16states[((21)) * STATE_BATCH_SIZE], 4*STATE_BATCH_SIZE);
++        AscendC::Add(i16c, i16cache, i16states[((32)) * STATE_BATCH_SIZE], 4*STATE_BATCH_SIZE);
++        //AscendC::Add(i16c, i16cache, i16m, 4*STATE_BATCH_SIZE);
++        Batch_StateUpdate(states, 4);
++
++        //i=2
++        AscendC::Add(i16cache, i16states[((5)) * STATE_BATCH_SIZE], i16states[((22)) * STATE_BATCH_SIZE], 4*STATE_BATCH_SIZE);
++        AscendC::Add(i16cache, i16cache, i16states[((25)) * STATE_BATCH_SIZE], 4*STATE_BATCH_SIZE);
++        AscendC::Add(i16c[4 * STATE_BATCH_SIZE], i16cache, i16states[((36)) * STATE_BATCH_SIZE], 4*STATE_BATCH_SIZE);
++        //AscendC::Add(i16c[4 * STATE_BATCH_SIZE], i16cache, i16m[4* STATE_BATCH_SIZE], 4*STATE_BATCH_SIZE);
++        Batch_StateUpdate(states[4*state_size], 4);
++        
++        //i=3
++        AscendC::Add(i16cache, i16states[((9)) * STATE_BATCH_SIZE], i16states[((26)) * STATE_BATCH_SIZE], 4*STATE_BATCH_SIZE);
++        AscendC::Add(i16cache, i16cache, i16states[((29)) * STATE_BATCH_SIZE], 4*STATE_BATCH_SIZE);
++        AscendC::Add(i16c[8* STATE_BATCH_SIZE], i16cache, i16states[((40)) * STATE_BATCH_SIZE], 4*STATE_BATCH_SIZE);
++        //AscendC::Add(i16c[8* STATE_BATCH_SIZE], i16cache, i16m[8* STATE_BATCH_SIZE], 4*STATE_BATCH_SIZE);
++        Batch_StateUpdate(states[8*state_size], 4);
++        //i=4
++        AscendC::Add(i16cache, i16states[((13)) * STATE_BATCH_SIZE], i16states[((30)) * STATE_BATCH_SIZE], 4*STATE_BATCH_SIZE);
++        AscendC::Add(i16cache, i16cache, i16states[((33)) * STATE_BATCH_SIZE], 4*STATE_BATCH_SIZE);
++        AscendC::Add(i16c[12 * STATE_BATCH_SIZE], i16cache, i16states[((44)) * STATE_BATCH_SIZE], 4*STATE_BATCH_SIZE);
++        //AscendC::Add(i16c[12 * STATE_BATCH_SIZE], i16cache, i16m[12* STATE_BATCH_SIZE], 4*STATE_BATCH_SIZE);
++        Batch_StateUpdate(states[12*state_size], 4);
++
++        //i=5
++        AscendC::Add(i16cache, i16states[((17)) * STATE_BATCH_SIZE], i16states[((34)) * STATE_BATCH_SIZE], 4*STATE_BATCH_SIZE);
++        AscendC::Add(i16cache, i16cache, i16states[((37)) * STATE_BATCH_SIZE], 4*STATE_BATCH_SIZE);
++        AscendC::Add(i16c[16 * STATE_BATCH_SIZE], i16cache, i16states[((48)) * STATE_BATCH_SIZE], 4*STATE_BATCH_SIZE);
++        //AscendC::Add(i16c[16 * STATE_BATCH_SIZE], i16cache, i16m[16* STATE_BATCH_SIZE], 4*STATE_BATCH_SIZE);
++        Batch_StateUpdate(states[16*state_size], 4);
++         AscendC::DataCopy(states, states[20* state_size], 37*state_size);
++        //i=6
++        AscendC::Add(i16cache, i16states[((1)) * STATE_BATCH_SIZE], i16states[((18)) * STATE_BATCH_SIZE], 4*STATE_BATCH_SIZE);
++        AscendC::Add(i16cache, i16cache, i16states[((21)) * STATE_BATCH_SIZE], 4*STATE_BATCH_SIZE);
++        AscendC::Add(i16c[20 * STATE_BATCH_SIZE], i16cache, i16states[((32)) * STATE_BATCH_SIZE], 4*STATE_BATCH_SIZE);
++        //AscendC::Add(i16c[20 * STATE_BATCH_SIZE], i16cache, i16m[20* STATE_BATCH_SIZE], 4*STATE_BATCH_SIZE);
++        Batch_StateUpdate(states, 4);
++        
++
++         //i=7
++        AscendC::Add(i16cache, i16states[((5)) * STATE_BATCH_SIZE], i16states[((22)) * STATE_BATCH_SIZE], 4*STATE_BATCH_SIZE);
++        AscendC::Add(i16cache, i16cache, i16states[((25)) * STATE_BATCH_SIZE], 4*STATE_BATCH_SIZE);
++        AscendC::Add(i16c[24 * STATE_BATCH_SIZE], i16cache, i16states[((36)) * STATE_BATCH_SIZE], 4*STATE_BATCH_SIZE);
++        //AscendC::Add(i16c[24 * STATE_BATCH_SIZE], i16cache, i16m[24* STATE_BATCH_SIZE], 4*STATE_BATCH_SIZE);
++        Batch_StateUpdate(states[4*state_size], 4);
++
++        //i=8
++         AscendC::Add(i16cache, i16states[((9)) * STATE_BATCH_SIZE], i16states[((26)) * STATE_BATCH_SIZE], 4*STATE_BATCH_SIZE);
++        AscendC::Add(i16cache, i16cache, i16states[((29)) * STATE_BATCH_SIZE], 4*STATE_BATCH_SIZE);
++        AscendC::Add(i16c[28 * STATE_BATCH_SIZE], i16cache, i16states[((40)) * STATE_BATCH_SIZE], 4*STATE_BATCH_SIZE);
++        //AscendC::Add(i16c[28 * STATE_BATCH_SIZE], i16cache, i16m[28* STATE_BATCH_SIZE], 4*STATE_BATCH_SIZE);
++        Batch_StateUpdate(states[8*state_size], 9);
++        
++         AscendC::DataCopy(states, states[17* state_size], 37*state_size);
++        
++    }
++    
++    AscendC::TPipe pipe;
++    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueY;
++    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueZ;
++    AscendC::GlobalTensor<uint16_t> yGm;
++    AscendC::GlobalTensor<uint16_t> zGm;
++    AscendC::TBuf<AscendC::TPosition::VECCALC> updateBuffer, keyBuffer;
++};
++
++#define STATE_BATCH_SIZE2 384
++class KernelEnc {
++public:
++    __aicore__ inline KernelEnc() {}
++    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, GM_ADDR z, size_t input_size) {
++        size_t M_BATCH_SIZE = input_size / (32 * STATE_BATCH_SIZE2);
++        xGm.SetGlobalBuffer((__gm__ uint16_t *)x + AscendC::GetBlockIdx() * 32 * STATE_BATCH_SIZE2 * M_BATCH_SIZE, 32 * STATE_BATCH_SIZE2 * M_BATCH_SIZE);
++        yGm.SetGlobalBuffer((__gm__ uint16_t *)y + AscendC::GetBlockIdx() * 32 * STATE_BATCH_SIZE2 * M_BATCH_SIZE, 32 * STATE_BATCH_SIZE2 * M_BATCH_SIZE);
++        zGm.SetGlobalBuffer((__gm__ uint16_t *)z + AscendC::GetBlockIdx() * 32 * STATE_BATCH_SIZE2 * M_BATCH_SIZE, 32 * STATE_BATCH_SIZE2 * M_BATCH_SIZE);
++        pipe.InitBuffer(inQueueX, 1, 32 * STATE_BATCH_SIZE2 * sizeof(uint16_t));
++        pipe.InitBuffer(inQueueY, 1, 32 * STATE_BATCH_SIZE2 * sizeof(uint16_t) );
++        pipe.InitBuffer(outQueueZ, 1, 32 * STATE_BATCH_SIZE2 * sizeof(uint16_t));
++    }
++    __aicore__ inline void Process(int input_size) {
++        size_t m_batch_size = input_size / (32 * STATE_BATCH_SIZE2);
++        for (int r=0; r < m_batch_size; r++){
++            CopyIn(r);
++            Compute(r);          
++            CopyOut(r);
++        }
++    }
++    
++private:
++    
++    __aicore__ inline void CopyIn(int progress) {
++        AscendC::LocalTensor<uint16_t> xLocal = inQueueX.AllocTensor<uint16_t>(); 
++        AscendC::DataCopy(xLocal, xGm[32 * STATE_BATCH_SIZE2 * progress], 32 * STATE_BATCH_SIZE2);
++        inQueueX.EnQue(xLocal);
++        AscendC::LocalTensor<uint16_t> yLocal = inQueueY.AllocTensor<uint16_t>(); 
++        AscendC::DataCopy(yLocal, yGm[32 * STATE_BATCH_SIZE2 * progress], 32 * STATE_BATCH_SIZE2);
++        inQueueY.EnQue(yLocal);
++    }
++    __aicore__ inline void Compute(int progress) {
++        AscendC::LocalTensor<uint16_t> xLocal = inQueueX.DeQue<uint16_t>();
++        AscendC::LocalTensor<uint16_t> yLocal = inQueueY.DeQue<uint16_t>();
++        
++        AscendC::LocalTensor<uint16_t> zLocal = outQueueZ.AllocTensor<uint16_t>();
++        AscendC::LocalTensor<int16_t> i16x = xLocal.ReinterpretCast<int16_t>();
++        AscendC::LocalTensor<int16_t> i16y = yLocal.ReinterpretCast<int16_t>();
++        AscendC::LocalTensor<int16_t> i16z = zLocal.ReinterpretCast<int16_t>();
++        AscendC::Add(i16z, i16x, i16y, 32 * STATE_BATCH_SIZE2);
++        outQueueZ.EnQue<uint16_t>(zLocal);
++        inQueueX.FreeTensor(xLocal);
++        inQueueY.FreeTensor(yLocal);
++    }
++    __aicore__ inline void CopyOut(int progress) {
++        AscendC::LocalTensor<uint16_t> zLocal = outQueueZ.DeQue<uint16_t>();
++       
++        AscendC::DataCopy(zGm[32 * STATE_BATCH_SIZE2 * progress], zLocal, 32 * STATE_BATCH_SIZE2);
++        outQueueZ.FreeTensor(zLocal);
++    }
++
++    AscendC::TPipe pipe;
++    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueX, inQueueY;
++    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueZ;
++    AscendC::GlobalTensor<uint16_t> xGm;
++    AscendC::GlobalTensor<uint16_t> yGm;
++    AscendC::GlobalTensor<uint16_t> zGm;
++};
++
++class KernelDec {
++public:
++    __aicore__ inline KernelDec() {}
++    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, GM_ADDR z, size_t input_size) {
++        size_t M_BATCH_SIZE = input_size / (32 * STATE_BATCH_SIZE2);
++        xGm.SetGlobalBuffer((__gm__ uint16_t *)x + AscendC::GetBlockIdx() * 32 * STATE_BATCH_SIZE2 * M_BATCH_SIZE, 32 * STATE_BATCH_SIZE2 * M_BATCH_SIZE);
++        yGm.SetGlobalBuffer((__gm__ uint16_t *)y + AscendC::GetBlockIdx() * 32 * STATE_BATCH_SIZE2 * M_BATCH_SIZE, 32 * STATE_BATCH_SIZE2 * M_BATCH_SIZE);
++        zGm.SetGlobalBuffer((__gm__ uint16_t *)z + AscendC::GetBlockIdx() * 32 * STATE_BATCH_SIZE2 * M_BATCH_SIZE, 32 * STATE_BATCH_SIZE2 * M_BATCH_SIZE);
++        pipe.InitBuffer(inQueueX, 1, 32 * STATE_BATCH_SIZE2 * sizeof(uint16_t));
++        pipe.InitBuffer(inQueueY, 1, 32 * STATE_BATCH_SIZE2 * sizeof(uint16_t) );
++        pipe.InitBuffer(outQueueZ, 1, 32 * STATE_BATCH_SIZE2 * sizeof(uint16_t));
++    }
++    __aicore__ inline void Process(int input_size) {
++        size_t m_batch_size = input_size / (32 * STATE_BATCH_SIZE2);
++        for (int r=0; r < m_batch_size; r++){
++            CopyIn(r);
++            Compute(r);          
++            CopyOut(r);
++        }
++    }
++    
++private:
++    
++    __aicore__ inline void CopyIn(int progress) {
++        AscendC::LocalTensor<uint16_t> xLocal = inQueueX.AllocTensor<uint16_t>(); 
++        AscendC::DataCopy(xLocal, xGm[32 * STATE_BATCH_SIZE2 * progress], 32 * STATE_BATCH_SIZE2);
++        inQueueX.EnQue(xLocal);
++        AscendC::LocalTensor<uint16_t> yLocal = inQueueY.AllocTensor<uint16_t>(); 
++        AscendC::DataCopy(yLocal, yGm[32 * STATE_BATCH_SIZE2 * progress], 32 * STATE_BATCH_SIZE2);
++        inQueueY.EnQue(yLocal);
++    }
++    __aicore__ inline void Compute(int progress) {
++        AscendC::LocalTensor<uint16_t> xLocal = inQueueX.DeQue<uint16_t>();
++        AscendC::LocalTensor<uint16_t> yLocal = inQueueY.DeQue<uint16_t>();
++        
++        AscendC::LocalTensor<uint16_t> zLocal = outQueueZ.AllocTensor<uint16_t>();
++        AscendC::LocalTensor<int16_t> i16x = xLocal.ReinterpretCast<int16_t>();
++        AscendC::LocalTensor<int16_t> i16y = yLocal.ReinterpretCast<int16_t>();
++        AscendC::LocalTensor<int16_t> i16z = zLocal.ReinterpretCast<int16_t>();
++        AscendC::Sub(i16z, i16x, i16y, 32 * STATE_BATCH_SIZE2);
++        outQueueZ.EnQue<uint16_t>(zLocal);
++        inQueueX.FreeTensor(xLocal);
++        inQueueY.FreeTensor(yLocal);
++    }
++    __aicore__ inline void CopyOut(int progress) {
++        AscendC::LocalTensor<uint16_t> zLocal = outQueueZ.DeQue<uint16_t>();
++       
++        AscendC::DataCopy(zGm[32 * STATE_BATCH_SIZE2 * progress], zLocal, 32 * STATE_BATCH_SIZE2);
++        outQueueZ.FreeTensor(zLocal);
++    }
++
++    AscendC::TPipe pipe;
++    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueX, inQueueY;
++    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueZ;
++    AscendC::GlobalTensor<uint16_t> xGm;
++    AscendC::GlobalTensor<uint16_t> yGm;
++    AscendC::GlobalTensor<uint16_t> zGm;
++};
++
++extern "C" __global__ __aicore__ void ascen_keystream(GM_ADDR keynonce, GM_ADDR keystream, size_t keystream_size)
++{
++    KernelAdd op;
++    op.Init(keynonce, keystream, keystream_size);
++    op.Process(keystream_size);
++}
++extern "C" __global__ __aicore__ void ascen_encrypt(GM_ADDR plaintext, GM_ADDR keystream, GM_ADDR ciphertext, size_t input_size)
++{   
++    KernelEnc op;
++    op.Init(plaintext, keystream, ciphertext, input_size);
++    op.Process(input_size);
++}
++extern "C" __global__ __aicore__ void ascen_decrypt(GM_ADDR ciphertext, GM_ADDR keystream, GM_ADDR plaintext, size_t input_size)
++{   
++    //x is ciphertext, y is keystream
++    KernelEnc op;
++    op.Init(ciphertext, keystream, plaintext, input_size);
++    op.Process(input_size);
++}
++
++
++namespace vllm_ascend {
++
++extern void ascen_keystream_impl(
++    uint32_t blockDim,
++    void *stream,
++    void* keynonce,
++    void* keystream,
++    uint32_t keystream_size)
++{
++    ascen_keystream<<<blockDim, nullptr, stream>>>(
++        keynonce,
++        keystream,
++        keystream_size
++    );
++}
++
++extern void ascen_encrypt_impl(
++    int64_t threadnum,
++    void *stream,
++    void* plaintext,   //输入
++    void* keystream,   //密钥流
++    void* ciphertext,  //输出
++    uint32_t input_size)
++{
++    // threadnum 参与决定 block/threads
++    int blocks = threadnum;
++    int threads = 1;
++    ascen_encrypt<<<32, nullptr, stream>>>(
++        plaintext,
++        keystream,
++        ciphertext,
++        input_size
++    );
++}
++
++extern void ascen_decrypt_impl(
++    int64_t threadnum,
++    void *stream,
++    void* plaintext,
++    void* keystream,
++    void* ciphertext,
++    uint32_t input_size)
++{
++    int blocks = static_cast<int>(threadnum);
++    int threads = 1;
++    ascen_decrypt<<<32, nullptr, stream>>>(
++        ciphertext,
++        keystream,
++        plaintext,
++        input_size
++    );
++}
++
++} // namespace vllm_ascend
+diff --git a/csrc/kernels/sm4.cpp b/csrc/kernels/sm4.cpp
+new file mode 100644
+index 000000000..2af5090d2
+--- /dev/null
++++ b/csrc/kernels/sm4.cpp
+@@ -0,0 +1,506 @@
++#include "kernel_operator.h"
++using namespace AscendC;
++
++constexpr int SM4_BLOCK_SIZE = 16;
++constexpr int SM4_NR = 32;
++constexpr int SM4_RK_WORDS = 32;
++constexpr int SM4_RK_BYTES = SM4_RK_WORDS * sizeof(uint32_t); // 128
++constexpr int SM4_RK_PAD_BYTES = 128;                         // 128 本身已 32B 对齐
++constexpr int VEC_BLOCKS       = 64 * 4;
++constexpr uint32_t MAX_BLOCKS_PER_CALL = VEC_BLOCKS;
++
++// SM4 常量表
++static const uint8_t SM4_SBOX[256] = {
++    0xd6,0x90,0xe9,0xfe,0xcc,0xe1,0x3d,0xb7,0x16,0xb6,0x14,0xc2,0x28,0xfb,0x2c,0x05,
++    0x2b,0x67,0x9a,0x76,0x2a,0xbe,0x04,0xc3,0xaa,0x44,0x13,0x26,0x49,0x86,0x06,0x99,
++    0x9c,0x42,0x50,0xf4,0x91,0xef,0x98,0x7a,0x33,0x54,0x0b,0x43,0xed,0xcf,0xac,0x62,
++    0xe4,0xb3,0x1c,0xa9,0xc9,0x08,0xe8,0x95,0x80,0xdf,0x94,0xfa,0x75,0x8f,0x3f,0xa6,
++    0x47,0x07,0xa7,0xfc,0xf3,0x73,0x17,0xba,0x83,0x59,0x3c,0x19,0xe6,0x85,0x4f,0xa8,
++    0x68,0x6b,0x81,0xb2,0x71,0x64,0xda,0x8b,0xf8,0xeb,0x0f,0x4b,0x70,0x56,0x9d,0x35,
++    0x1e,0x24,0x0e,0x5e,0x63,0x58,0xd1,0xa2,0x25,0x22,0x7c,0x3b,0x01,0x21,0x78,0x87,
++    0xd4,0x00,0x46,0x57,0x9f,0xd3,0x27,0x52,0x4c,0x36,0x02,0xe7,0xa0,0xc4,0xc8,0x9e,
++    0xea,0xbf,0x8a,0xd2,0x40,0xc7,0x38,0xb5,0xa3,0xf7,0xf2,0xce,0xf9,0x61,0x15,0xa1,
++    0xe0,0xae,0x5d,0xa4,0x9b,0x34,0x1a,0x55,0xad,0x93,0x32,0x30,0xf5,0x8c,0xb1,0xe3,
++    0x1d,0xf6,0xe2,0x2e,0x82,0x66,0xca,0x60,0xc0,0x29,0x23,0xab,0x0d,0x53,0x4e,0x6f,
++    0xd5,0xdb,0x37,0x45,0xde,0xfd,0x8e,0x2f,0x03,0xff,0x6a,0x72,0x6d,0x6c,0x5b,0x51,
++    0x8d,0x1b,0xaf,0x92,0xbb,0xdd,0xbc,0x7f,0x11,0xd9,0x5c,0x41,0x1f,0x10,0x5a,0xd8,
++    0x0a,0xc1,0x31,0x88,0xa5,0xcd,0x7b,0xbd,0x2d,0x74,0xd0,0x12,0xb8,0xe5,0xb4,0xb0,
++    0x89,0x69,0x97,0x4a,0x0c,0x96,0x77,0x7e,0x65,0xb9,0xf1,0x09,0xc5,0x6e,0xc6,0x84,
++    0x18,0xf0,0x7d,0xec,0x3a,0xdc,0x4d,0x20,0x79,0xee,0x5f,0x3e,0xd7,0xcb,0x39,0x48
++};
++
++
++class KernelSM4CTR {
++public:
++
++    LocalTensor<uint32_t> Sbox;
++    __aicore__ inline KernelSM4CTR() {}
++
++    __aicore__ inline void Init(__gm__ uint8_t* rk128,
++                                __gm__ uint8_t* in,
++                                __gm__ uint8_t* out,
++                                uint32_t dataSize)
++    {
++        rkGlobal.SetGlobalBuffer((__gm__ uint8_t*)rk128);
++        inGlobal.SetGlobalBuffer((__gm__ uint8_t*)in);
++        outGlobal.SetGlobalBuffer((__gm__ uint8_t*)out);
++
++        this->dataSize = dataSize;
++        //  这里按完整 block 处理，要求 dataSize 是 16 的整数倍
++        this->totalBlocks = dataSize / SM4_BLOCK_SIZE;
++
++        pipe.InitBuffer(rkBytesQ, 1, SM4_RK_PAD_BYTES);                         // 128B
++        pipe.InitBuffer(rkWordsQ, 1, SM4_RK_WORDS * sizeof(uint32_t));          // 32 words
++        pipe.InitBuffer(inQ,      1, MAX_BLOCKS_PER_CALL * SM4_BLOCK_SIZE + 64);
++        pipe.InitBuffer(outQ,     1, MAX_BLOCKS_PER_CALL * SM4_BLOCK_SIZE + 64);
++        pipe.InitBuffer(scratchQ, 1, VEC_BLOCKS * sizeof(uint32_t) * 4);   // bytes        state
++        pipe.InitBuffer(rkxQ,     1, VEC_BLOCKS * sizeof(uint32_t) * 4);  //rk * 8  rkAll
++        pipe.InitBuffer(btmpQ,    1, VEC_BLOCKS * sizeof(uint32_t) * 4);                //存储中间数据 b0~b3 
++        pipe.InitBuffer(SboxBuf, 256 * sizeof(uint32_t));
++        pipe.InitBuffer(RotateQ,  1, VEC_BLOCKS * sizeof(uint32_t) * 4);
++        pipe.InitBuffer(tLQ,      1, VEC_BLOCKS * sizeof(uint32_t));
++
++
++        LocalTensor<uint32_t>SAll = SboxBuf.Get<uint32_t>();
++        Sbox = SAll;
++        for (int i=0; i < 256 ;++i){
++            Sbox(i) = (uint32_t)SM4_SBOX[i];
++        }
++    }
++
++    __aicore__ inline void Process()
++    {   
++        uint32_t blockId  = GetBlockIdx();   //当前核的编号
++        uint32_t blockNum = GetBlockNum();   //总共启动核数
++
++        // 先把 totalBlocks 按核均分
++        uint32_t blocksPerCore = (totalBlocks + blockNum - 1) / blockNum;
++
++        uint32_t coreStart = blockId * blocksPerCore;
++        uint32_t coreEnd   = min(coreStart + blocksPerCore, totalBlocks);
++
++        if (coreStart >= coreEnd) {
++            return;
++        }
++
++        uint32_t blocksToProcess = min(MAX_BLOCKS_PER_CALL, coreEnd - coreStart);
++        // 每个核内部再按 tile 循环
++        for (uint32_t tileStart = coreStart;tileStart < coreEnd; tileStart += blocksToProcess) {
++            blocksToProcess = min(MAX_BLOCKS_PER_CALL, coreEnd - tileStart);
++            CopyIn (tileStart, blocksToProcess);
++            Compute(blocksToProcess);
++            CopyOut(tileStart, blocksToProcess);
++        }
++    }
++
++
++private:
++    TPipe pipe;
++    TQue<TPosition::VECIN, 1>  rkBytesQ;
++    TQue<TPosition::VECIN, 1>  rkWordsQ;
++    TQue<TPosition::VECIN, 1>  inQ;
++    TQue<TPosition::VECOUT, 1> outQ;
++    TQue<TPosition::VECCALC, 1> scratchQ;
++    TQue<TPosition::VECCALC, 1> rkxQ;
++    TQue<TPosition::VECCALC, 1> btmpQ;
++    TBuf<TPosition::VECCALC> SboxBuf;
++    TQue<TPosition::VECCALC, 1> RotateQ;
++    TQue<TPosition::VECCALC, 1> tLQ;
++
++
++    GlobalTensor<uint8_t> rkGlobal;
++    GlobalTensor<uint8_t> inGlobal;
++    GlobalTensor<uint8_t> outGlobal;
++
++    uint32_t dataSize{0};
++    uint32_t totalBlocks{0};
++
++private:
++    __aicore__ inline uint32_t Rotl32(uint32_t x, uint32_t n)
++    {
++        return (x << n) | (x >> (32 - n));
++    }
++
++    __aicore__ inline uint32_t Tau(uint32_t x)
++    {
++        uint32_t b0 = SM4_SBOX[(x >> 24) & 0xFF];
++        uint32_t b1 = SM4_SBOX[(x >> 16) & 0xFF];
++        uint32_t b2 = SM4_SBOX[(x >> 8)  & 0xFF];
++        uint32_t b3 = SM4_SBOX[(x >> 0)  & 0xFF];
++        return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
++    }
++
++    // SM4 轮函数里的线性变换 L
++    __aicore__ inline uint32_t L(uint32_t x)
++    {
++        return x ^ Rotl32(x, 2) ^ Rotl32(x, 10) ^ Rotl32(x, 18) ^ Rotl32(x, 24);
++    }
++
++    __aicore__ inline uint32_t T(uint32_t x)
++    {
++        return L(Tau(x));
++    }
++
++    __aicore__ inline void CopyIn(uint32_t startBlock, uint32_t blocksToProcess)
++    {
++        // 1) Copy round keys bytes (128B)
++        LocalTensor<uint8_t> rkBytesLT = rkBytesQ.AllocTensor<uint8_t>();
++        DataCopy(rkBytesLT, rkGlobal, SM4_RK_PAD_BYTES);
++
++        AscendC::PipeBarrier<PIPE_MTE2>();   // 先等 rkBytesLT 搬完
++
++        // Pack to 32 big-endian uint32 words
++        LocalTensor<uint32_t> rkWordsLT = rkWordsQ.AllocTensor<uint32_t>();
++        #pragma unroll
++        for (int w = 0; w < SM4_RK_WORDS; ++w) {
++            int b = w * 4;
++            uint32_t b0 = rkBytesLT(b + 0);
++            uint32_t b1 = rkBytesLT(b + 1);
++            uint32_t b2 = rkBytesLT(b + 2);
++            uint32_t b3 = rkBytesLT(b + 3);
++            rkWordsLT(w) = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
++        }
++
++        // 3) Copy input blocks
++        LocalTensor<uint8_t> inLocal = inQ.AllocTensor<uint8_t>();
++        uint32_t inputOffset = startBlock * SM4_BLOCK_SIZE;
++        uint32_t inputSize = blocksToProcess * SM4_BLOCK_SIZE;
++        DataCopy(inLocal, inGlobal[inputOffset], inputSize);
++
++        rkBytesQ.EnQue(rkBytesLT);
++        rkWordsQ.EnQue(rkWordsLT);
++        inQ.EnQue(inLocal);
++    }
++
++    __aicore__ inline void Compute(uint32_t blocksToProcess)
++    {
++        LocalTensor<uint32_t> rkWordsLT = rkWordsQ.DeQue<uint32_t>();
++        LocalTensor<uint8_t>  inLocal   = inQ.DeQue<uint8_t>();
++        LocalTensor<uint8_t>  outLocal  = outQ.AllocTensor<uint8_t>();
++        LocalTensor<uint8_t>  rkBytesLT = rkBytesQ.DeQue<uint8_t>(); // 仅为后面释放
++
++        AscendC::PipeBarrier<PIPE_MTE2>();  
++            
++        LocalTensor<uint32_t> statelocal = scratchQ.AllocTensor<uint32_t>();
++        LocalTensor<uint32_t> state0 = statelocal;
++        LocalTensor<uint32_t> state1 = statelocal[VEC_BLOCKS ];
++        LocalTensor<uint32_t> state2 = statelocal[VEC_BLOCKS * 2];
++        LocalTensor<uint32_t> state3 = statelocal[VEC_BLOCKS * 3];
++        
++        for (uint32_t b = 0; b < blocksToProcess; b += VEC_BLOCKS) {
++        // uint32_t curBlocks = min((uint32_t)VEC_BLOCKS, blocksToProcess - b);
++            #pragma unroll
++            for (uint32_t lane = 0; lane < VEC_BLOCKS; ++lane) {
++                uint32_t base = (b + lane) << 4;
++
++                uint32_t t0 = (uint32_t)inLocal(base + 0) << 24 |
++                            (uint32_t)inLocal(base + 1) << 16 |
++                            (uint32_t)inLocal(base + 2) << 8  |
++                            (uint32_t)inLocal(base + 3);
++
++                uint32_t t1 = (uint32_t)inLocal(base + 4) << 24 |
++                            (uint32_t)inLocal(base + 5) << 16 |
++                            (uint32_t)inLocal(base + 6) << 8  |
++                            (uint32_t)inLocal(base + 7);
++
++                uint32_t t2 = (uint32_t)inLocal(base + 8) << 24 |
++                            (uint32_t)inLocal(base + 9) << 16 |
++                            (uint32_t)inLocal(base + 10) << 8 |
++                            (uint32_t)inLocal(base + 11);
++
++                uint32_t t3 = (uint32_t)inLocal(base + 12) << 24 |
++                            (uint32_t)inLocal(base + 13) << 16 |
++                            (uint32_t)inLocal(base + 14) << 8 |
++                            (uint32_t)inLocal(base + 15);
++
++                    state0(lane) = t0;
++                    state1(lane) = t1;
++                    state2(lane) = t2;
++                    state3(lane) = t3;
++                }
++                SM4_Encrypt_Vector(outLocal, state0, state1, state2, state3, rkWordsLT, b);
++            }
++
++
++
++        outQ.EnQue<uint8_t>(outLocal);
++        rkWordsQ.FreeTensor(rkWordsLT);
++        inQ.FreeTensor(inLocal);
++        rkBytesQ.FreeTensor(rkBytesLT);
++        scratchQ.FreeTensor(statelocal);
++    }
++
++    __aicore__ inline void CopyOut(uint32_t startBlock, uint32_t blocksToProcess)
++    {
++        LocalTensor<uint8_t> outLocal = outQ.DeQue<uint8_t>();
++
++        uint32_t outputOffset = startBlock * SM4_BLOCK_SIZE;
++        uint32_t outputSize = blocksToProcess * SM4_BLOCK_SIZE;
++        AscendC::PipeBarrier<PIPE_MTE3>();
++        DataCopy(outGlobal[outputOffset], outLocal, outputSize);
++
++        outQ.FreeTensor(outLocal);
++    }
++
++
++    __aicore__ inline void TableTransform(LocalTensor<uint32_t> src,
++                                          LocalTensor<uint32_t> b0,
++                                          LocalTensor<uint32_t> b1,
++                                          LocalTensor<uint32_t> b2,
++                                          LocalTensor<uint32_t> b3)
++    {
++        // b0 = ((src >> 24) & 0xFF) << 2
++        AscendC::ShiftRight(b0, src, (uint32_t)24, VEC_BLOCKS);
++
++        // b1 = ((src << 8) >> 24) << 2
++        AscendC::ShiftLeft (b1, src, (uint32_t)8 , VEC_BLOCKS);
++        AscendC::ShiftRight(b1, b1 , (uint32_t)24, VEC_BLOCKS);
++
++        // b2 = ((src << 16) >> 24) << 2
++        AscendC::ShiftLeft (b2, src, (uint32_t)16, VEC_BLOCKS);
++        AscendC::ShiftRight(b2, b2 , (uint32_t)24, VEC_BLOCKS);
++
++        // b3 = ((src << 24) >> 24) << 2
++        AscendC::ShiftLeft (b3, src, (uint32_t)24, VEC_BLOCKS);
++        AscendC::ShiftRight(b3, b3 , (uint32_t)24, VEC_BLOCKS);
++
++        // Gather 的 offset 单位是 bytes，uint32_t 表项宽度 4B，因此乘 4
++        AscendC::ShiftLeft(b0, b0, (uint32_t)2, VEC_BLOCKS);
++        AscendC::ShiftLeft(b1, b1, (uint32_t)2, VEC_BLOCKS);
++        AscendC::ShiftLeft(b2, b2, (uint32_t)2, VEC_BLOCKS);
++        AscendC::ShiftLeft(b3, b3, (uint32_t)2, VEC_BLOCKS);
++
++        AscendC::Gather(b0, Sbox, b0, (uint32_t)0, VEC_BLOCKS);
++        AscendC::Gather(b1, Sbox, b1, (uint32_t)0, VEC_BLOCKS);
++        AscendC::Gather(b2, Sbox, b2, (uint32_t)0, VEC_BLOCKS);
++        AscendC::Gather(b3, Sbox, b3, (uint32_t)0, VEC_BLOCKS);
++
++        AscendC::ShiftLeft(b0, b0, (uint32_t)24, VEC_BLOCKS);
++        AscendC::ShiftLeft(b1, b1, (uint32_t)16, VEC_BLOCKS);
++        AscendC::ShiftLeft(b2, b2, (uint32_t)8 , VEC_BLOCKS);
++
++        LocalTensor<uint16_t> b0_u16 = b0.ReinterpretCast<uint16_t>();
++        LocalTensor<uint16_t> b1_u16 = b1.ReinterpretCast<uint16_t>();
++        LocalTensor<uint16_t> b2_u16 = b2.ReinterpretCast<uint16_t>();
++        LocalTensor<uint16_t> b3_u16 = b3.ReinterpretCast<uint16_t>();
++
++        LocalTensor<uint32_t> tLocal =  tLQ.AllocTensor<uint32_t>();
++        LocalTensor<uint16_t> tLocal_u16 = tLocal.ReinterpretCast<uint16_t>();
++
++        //uint16_t
++        AscendC::Or(b0_u16, b0_u16, b1_u16, VEC_BLOCKS * 2);
++        AscendC::Or(b0_u16, b0_u16, b2_u16, VEC_BLOCKS * 2); 
++        AscendC::Or(tLocal_u16, b0_u16, b3_u16, VEC_BLOCKS * 2);
++
++        //循环左移
++        LocalTensor<uint32_t> rotateAll =  RotateQ.AllocTensor<uint32_t>();
++        LocalTensor<uint32_t> rlocal0 = rotateAll;
++        LocalTensor<uint32_t> rlocal1 = rotateAll[VEC_BLOCKS];
++        LocalTensor<uint32_t> rlocal2 = rotateAll[VEC_BLOCKS * 2];
++        LocalTensor<uint32_t> rlocal3 = rotateAll[VEC_BLOCKS * 3];
++
++        LocalTensor<uint16_t> rlocal0_u16 = rlocal0.ReinterpretCast<uint16_t>();
++        LocalTensor<uint16_t> rlocal1_u16 = rlocal1.ReinterpretCast<uint16_t>();
++        LocalTensor<uint16_t> rlocal2_u16 = rlocal2.ReinterpretCast<uint16_t>();
++        LocalTensor<uint16_t> rlocal3_u16 = rlocal3.ReinterpretCast<uint16_t>();
++
++        AscendC::ShiftLeft(b0, tLocal, (uint32_t)2, VEC_BLOCKS);
++        AscendC::ShiftRight(rlocal0, tLocal, (uint32_t)30, VEC_BLOCKS);
++
++        AscendC::ShiftLeft(b1, tLocal, (uint32_t)10, VEC_BLOCKS);
++        AscendC::ShiftRight(rlocal1, tLocal, (uint32_t)22, VEC_BLOCKS);
++
++        AscendC::ShiftLeft(b2, tLocal, (uint32_t)18, VEC_BLOCKS);
++        AscendC::ShiftRight(rlocal2, tLocal, (uint32_t)14, VEC_BLOCKS);
++
++        AscendC::ShiftLeft(b3, tLocal, (uint32_t)24, VEC_BLOCKS);
++        AscendC::ShiftRight(rlocal3, tLocal, (uint32_t)8, VEC_BLOCKS);
++
++        AscendC::Or(rlocal0_u16, b0_u16, rlocal0_u16, VEC_BLOCKS * 2);
++        AscendC::Or(rlocal1_u16, b1_u16, rlocal1_u16, VEC_BLOCKS * 2);
++        AscendC::Or(rlocal2_u16, b2_u16, rlocal2_u16, VEC_BLOCKS * 2);
++        AscendC::Or(rlocal3_u16, b3_u16, rlocal3_u16, VEC_BLOCKS * 2);
++
++        AscendC::Xor(b0_u16,  tLocal_u16, rlocal0_u16, VEC_BLOCKS * 2);
++        AscendC::Xor(b1_u16,  b0_u16    , rlocal1_u16, VEC_BLOCKS * 2);
++        AscendC::Xor(b2_u16,  b1_u16    , rlocal2_u16, VEC_BLOCKS * 2);
++        AscendC::Xor(tLocal_u16, b2_u16 , rlocal3_u16, VEC_BLOCKS * 2);
++
++        AscendC::ShiftLeft(src, tLocal, (uint32_t)0, VEC_BLOCKS);
++
++        RotateQ.FreeTensor(rotateAll);
++        tLQ.FreeTensor(tLocal);
++
++    }
++
++
++ __aicore__ inline void  SM4_Encrypt_Vector(LocalTensor<uint8_t> outLocal,
++                           LocalTensor<uint32_t> state0,
++                           LocalTensor<uint32_t> state1,
++                           LocalTensor<uint32_t> state2,
++                           LocalTensor<uint32_t> state3,
++                           LocalTensor<uint32_t> rkWordsLT,
++                           uint32_t batchStart
++                        )
++{      
++        LocalTensor<uint32_t> rkAll =  rkxQ.AllocTensor<uint32_t>();
++        LocalTensor<uint32_t> rkq0 = rkAll;
++        LocalTensor<uint32_t> rkq1 = rkAll[VEC_BLOCKS];
++        LocalTensor<uint32_t> rkq2 = rkAll[VEC_BLOCKS * 2];
++        LocalTensor<uint32_t> rkq3 = rkAll[VEC_BLOCKS * 3];
++
++        LocalTensor<uint16_t> state0_u16 = state0.ReinterpretCast<uint16_t>();
++        LocalTensor<uint16_t> state1_u16 = state1.ReinterpretCast<uint16_t>();
++        LocalTensor<uint16_t> state2_u16 = state2.ReinterpretCast<uint16_t>();
++        LocalTensor<uint16_t> state3_u16 = state3.ReinterpretCast<uint16_t>();
++
++        LocalTensor<uint16_t> rkq0_u16 = rkq0.ReinterpretCast<uint16_t>();
++        LocalTensor<uint16_t> rkq1_u16 = rkq1.ReinterpretCast<uint16_t>();
++        LocalTensor<uint16_t> rkq2_u16 = rkq2.ReinterpretCast<uint16_t>();
++        LocalTensor<uint16_t> rkq3_u16 = rkq3.ReinterpretCast<uint16_t>();
++
++        LocalTensor<uint32_t> blocal = btmpQ.AllocTensor<uint32_t>();
++        LocalTensor<uint32_t> b0 = blocal;
++        LocalTensor<uint32_t> b1 = blocal[VEC_BLOCKS];
++        LocalTensor<uint32_t> b2 = blocal[VEC_BLOCKS * 2];
++        LocalTensor<uint32_t> b3 = blocal[VEC_BLOCKS * 3];
++
++        LocalTensor<uint16_t> b0_u16 = b0.ReinterpretCast<uint16_t>();
++        LocalTensor<uint16_t> b1_u16 = b1.ReinterpretCast<uint16_t>();
++        LocalTensor<uint16_t> b2_u16 = b2.ReinterpretCast<uint16_t>();
++        LocalTensor<uint16_t> b3_u16 = b3.ReinterpretCast<uint16_t>();
++
++        for (int r = 0; r <SM4_NR; r+=4) {        
++            AscendC::Duplicate(rkq0 , (uint32_t)rkWordsLT(r + 0), VEC_BLOCKS);
++            AscendC::Xor(rkq1_u16 , state2_u16 , state3_u16 , VEC_BLOCKS * 2);
++            AscendC::Xor(b1_u16   , rkq1_u16   , rkq0_u16   , VEC_BLOCKS * 2);
++            AscendC::Xor(rkq0_u16 , b1_u16     , state1_u16 , VEC_BLOCKS * 2);
++            TableTransform(rkq0, b0, b1, b2, b3);
++            AscendC::Xor(b0_u16, state0_u16, rkq0_u16, VEC_BLOCKS * 2);
++            // AscendC::Copy(state0, b0, mask, repeatTime, params);
++            AscendC::ShiftLeft(state0, b0, (uint32_t)0, VEC_BLOCKS);
++            
++            AscendC::Xor(b1_u16, rkq1_u16, state0_u16, VEC_BLOCKS * 2);
++            AscendC::Duplicate(rkq1 , (uint32_t)rkWordsLT(r + 1), VEC_BLOCKS);
++            AscendC::Xor(rkq0_u16, rkq1_u16, b1_u16, VEC_BLOCKS * 2);
++            TableTransform(rkq0, b0, b1, b2, b3);
++            AscendC::Xor(b0_u16, state1_u16, rkq0_u16, VEC_BLOCKS * 2);
++            // AscendC::Copy(state1, b0, mask, repeatTime, params);
++            AscendC::ShiftLeft(state1, b0, (uint32_t)0, VEC_BLOCKS);
++
++            AscendC::Duplicate(rkq2 , (uint32_t)rkWordsLT(r + 2), VEC_BLOCKS);
++            AscendC::Xor(rkq3_u16 , state0_u16 , state1_u16 , VEC_BLOCKS * 2);
++            AscendC::Xor(b0_u16  , rkq2_u16, state3_u16, VEC_BLOCKS * 2);
++            AscendC::Xor(rkq0_u16, b0_u16  , rkq3_u16  , VEC_BLOCKS * 2);
++            TableTransform(rkq0, b0, b1, b2, b3);
++            AscendC::Xor(b0_u16, state2_u16, rkq0_u16, VEC_BLOCKS * 2);
++            // AscendC::Copy(state2, b0, mask, repeatTime, params);
++            AscendC::ShiftLeft(state2, b0, (uint32_t)0, VEC_BLOCKS);
++
++            AscendC::Xor(b1_u16, rkq3_u16, state2_u16, VEC_BLOCKS * 2);
++            AscendC::Duplicate(rkq3 , (uint32_t)rkWordsLT(r + 3), VEC_BLOCKS);
++            AscendC::Xor(rkq0_u16, rkq3_u16, b1_u16, VEC_BLOCKS * 2);
++            TableTransform(rkq0, b0, b1, b2, b3);
++            AscendC::Xor(b0_u16, state3_u16, rkq0_u16, VEC_BLOCKS * 2);
++            // AscendC::Copy(state3, b0, mask, repeatTime, params);
++            AscendC::ShiftLeft(state3, b0, (uint32_t)0, VEC_BLOCKS);
++        }
++
++        //输出 反序
++        for (uint32_t lane = 0; lane < VEC_BLOCKS; ++lane){
++            // 拆成字节并写回 outLocal
++            uint32_t base = (batchStart + lane) << 4;   // *16
++            uint32_t t0 = state3(lane);
++            uint32_t t1 = state2(lane);
++            uint32_t t2 = state1(lane);
++            uint32_t t3 = state0(lane);
++
++            outLocal(base + 0)  = uint8_t(t0 >> 24);
++            outLocal(base + 1)  = uint8_t(t0 >> 16);
++            outLocal(base + 2)  = uint8_t(t0 >> 8);
++            outLocal(base + 3)  = uint8_t(t0);
++
++            outLocal(base + 4)  = uint8_t(t1 >> 24);
++            outLocal(base + 5)  = uint8_t(t1 >> 16);
++            outLocal(base + 6)  = uint8_t(t1 >> 8);
++            outLocal(base + 7)  = uint8_t(t1);
++
++            outLocal(base + 8)  = uint8_t(t2 >> 24);
++            outLocal(base + 9)  = uint8_t(t2 >> 16);
++            outLocal(base + 10) = uint8_t(t2 >> 8);
++            outLocal(base + 11) = uint8_t(t2);
++
++            outLocal(base + 12) = uint8_t(t3 >> 24);
++            outLocal(base + 13) = uint8_t(t3 >> 16);
++            outLocal(base + 14) = uint8_t(t3 >> 8);
++            outLocal(base + 15) = uint8_t(t3);
++        }
++
++        btmpQ.FreeTensor(blocal); 
++        rkxQ.FreeTensor(rkAll);
++}
++
++
++
++    __aicore__ inline void EncryptBlock_SM4(
++        LocalTensor<uint8_t> outTensor,      // 16B sub-tensor
++        LocalTensor<uint8_t> inTensor,       // 16B sub-tensor
++        LocalTensor<uint32_t> rkWordsLT      // 32 x uint32 round keys (big-endian packed)
++    ) {
++        // 读入 128-bit 明文，按大端打成 4 个 32-bit 字
++        uint32_t x0 = (uint32_t(inTensor(0))  << 24) | (uint32_t(inTensor(1))  << 16) |
++                      (uint32_t(inTensor(2))  << 8)  |  uint32_t(inTensor(3));
++        uint32_t x1 = (uint32_t(inTensor(4))  << 24) | (uint32_t(inTensor(5))  << 16) |
++                      (uint32_t(inTensor(6))  << 8)  |  uint32_t(inTensor(7));
++        uint32_t x2 = (uint32_t(inTensor(8))  << 24) | (uint32_t(inTensor(9))  << 16) |
++                      (uint32_t(inTensor(10)) << 8)  |  uint32_t(inTensor(11));
++        uint32_t x3 = (uint32_t(inTensor(12)) << 24) | (uint32_t(inTensor(13)) << 16) |
++                      (uint32_t(inTensor(14)) << 8)  |  uint32_t(inTensor(15));
++
++        #pragma unroll
++        for (int r = 0; r < SM4_NR; r += 4) {
++            x0 = x0 ^ T(x1 ^ x2 ^ x3 ^ rkWordsLT(r + 0));
++            x1 = x1 ^ T(x2 ^ x3 ^ x0 ^ rkWordsLT(r + 1));
++            x2 = x2 ^ T(x3 ^ x0 ^ x1 ^ rkWordsLT(r + 2));
++            x3 = x3 ^ T(x0 ^ x1 ^ x2 ^ rkWordsLT(r + 3));
++        }
++
++        // SM4 输出顺序为 X35 X34 X33 X32，即最终 4 字反序输出
++        outTensor(0)  = uint8_t(x3 >> 24); outTensor(1)  = uint8_t(x3 >> 16);
++        outTensor(2)  = uint8_t(x3 >> 8);  outTensor(3)  = uint8_t(x3);
++        outTensor(4)  = uint8_t(x2 >> 24); outTensor(5)  = uint8_t(x2 >> 16);
++        outTensor(6)  = uint8_t(x2 >> 8);  outTensor(7)  = uint8_t(x2);
++        outTensor(8)  = uint8_t(x1 >> 24); outTensor(9)  = uint8_t(x1 >> 16);
++        outTensor(10) = uint8_t(x1 >> 8);  outTensor(11) = uint8_t(x1);
++        outTensor(12) = uint8_t(x0 >> 24); outTensor(13) = uint8_t(x0 >> 16);
++        outTensor(14) = uint8_t(x0 >> 8);  outTensor(15) = uint8_t(x0);
++    }
++};
++
++// =========================
++// Kernel Entry
++// =========================
++extern "C" __global__ __aicore__ void sm4_ctr_encrypt(
++    __gm__ uint8_t* roundKeys128,   // GM: 128B = 32 * uint32 round keys
++    __gm__ uint8_t* input,          // GM: dataSize bytes, must be multiple of 16
++    __gm__ uint8_t* output,         // GM: dataSize bytes
++    uint32_t dataSize)
++{
++    KernelSM4CTR op;
++    op.Init(roundKeys128, input, output, dataSize);
++    op.Process();
++}
++
++namespace vllm_ascend {
++// Host wrapper: blockDim = number of cores to use
++void sm4_ctr_encrypt_do_impl(uint32_t blockDim, void* stream,
++                        void* roundKeys128, void* input, void* output,
++                        uint32_t dataSize)
++{
++    sm4_ctr_encrypt<<<blockDim, nullptr, stream>>>(
++        (__gm__ uint8_t*)roundKeys128,
++        (__gm__ uint8_t*)input,
++        (__gm__ uint8_t*)output,
++        dataSize);
++}
++}
+\ No newline at end of file
+diff --git a/csrc/ops.h b/csrc/ops.h
+index e8207b70d..faff15c61 100644
+--- a/csrc/ops.h
++++ b/csrc/ops.h
+@@ -224,4 +224,42 @@ namespace vllm_ascend {
+         void *tiling, 
+         uint32_t nounce, 
+         uint32_t dataSize);
++
++    extern void morus_encrypt_do_impl(
++        int64_t threadnum, 
++        void* enc_stream, 
++        uint16_t* input_aligned_ptr, 
++        uint16_t* key_nounce_ptr,
++        uint16_t* output_aligned_ptr, 
++        int64_t m_batch_size);
++         
++    extern void ascen_keystream_impl(
++        uint32_t blockDim,
++        void *stream,
++        void* keynonce,
++        void* keystream,
++        uint32_t keystream_size);
++
++    extern void ascen_encrypt_impl(
++        int64_t threadnum,
++        void *stream,
++        void* plaintext,
++        void* keystream,
++        void* ciphertext,
++        uint32_t input_size);
++
++    extern void ascen_decrypt_impl(
++        int64_t threadnum,
++        void *stream,
++        void* plaintext,
++        void* keystream,
++        void* ciphertext,
++        uint32_t input_size);
++    extern void sm4_ctr_encrypt_do_impl(
++        uint32_t blockDim,
++        void* stream,
++        void* roundKeys128,
++        void* input,
++        void* output,
++        uint32_t dataSize);
+ }
+diff --git a/csrc/torch_binding.cpp b/csrc/torch_binding.cpp
+index ab0f97825..3d3de2df0 100644
+--- a/csrc/torch_binding.cpp
++++ b/csrc/torch_binding.cpp
+@@ -111,6 +111,10 @@ int64_t current_pos = -1;
+ int64_t current_pos_unalign = -1;
+ int64_t current_pos_send = -1;
+ int64_t current_pos_recv = -1;
++int64_t sm4_current_pos = -1;
++int64_t sm4_current_pos_unalign = -1;
++int64_t sm4_current_pos_send = -1;
++int64_t sm4_current_pos_recv = -1;
+ 
+ int32_t nounce_counter = []() {
+     std::random_device rd;
+@@ -122,10 +126,15 @@ int32_t nounce_counter = []() {
+ constexpr int AES_BLOCK_SIZE = 16;
+ constexpr int AES_MAX_BLOCKS_PER_CALL = 4096;
+ constexpr uint32_t AES_VEC_THREAD_NUM = 1024;
++constexpr uint32_t SM4_THREAD_NUM = 32;
+ constexpr int CHACHA20_MAX_BLOCKS_PER_CALL = 2048;
+ constexpr int AES128_RK_BYTES = 16 * (10 + 1);
+ constexpr int AES128_RK_PAD_BYTES = 192;
+ 
++static constexpr uint32_t SM4_BLOCK_SIZE = 16;
++static constexpr uint32_t SM4_RK_NUM = 32;
++static constexpr uint32_t SM4_RK_BYTES = SM4_RK_NUM * sizeof(uint32_t); // 128B
++
+ uint8_t key[16] = {
+     0x60, 0x3d, 0xeb, 0x10,
+     0x15, 0xca, 0x71, 0xbe,
+@@ -205,6 +214,91 @@ void padRoundKeys192(const uint8_t rk176[AES128_RK_BYTES], uint8_t rk192[AES128_
+     std::memset(rk192 + AES128_RK_BYTES, 0, AES128_RK_PAD_BYTES - AES128_RK_BYTES);
+ }
+ 
++
++void expandKeySM4(const uint8_t inKey[16], uint8_t outExpanded[SM4_RK_BYTES])
++{
++    static const uint32_t FK[4] = {
++        0xa3b1bac6,
++        0x56aa3350,
++        0x677d9197,
++        0xb27022dc
++    };
++
++    static const uint32_t CK[32] = {
++        0x00070e15, 0x1c232a31, 0x383f464d, 0x545b6269,
++        0x70777e85, 0x8c939aa1, 0xa8afb6bd, 0xc4cbd2d9,
++        0xe0e7eef5, 0xfc030a11, 0x181f262d, 0x343b4249,
++        0x50575e65, 0x6c737a81, 0x888f969d, 0xa4abb2b9,
++        0xc0c7ced5, 0xdce3eaf1, 0xf8ff060d, 0x141b2229,
++        0x30373e45, 0x4c535a61, 0x686f767d, 0x848b9299,
++        0xa0a7aeb5, 0xbcc3cad1, 0xd8dfe6ed, 0xf4fb0209,
++        0x10171e25, 0x2c333a41, 0x484f565d, 0x646b7279
++    };
++
++    static const uint8_t SBOX[256] = {
++        0xd6,0x90,0xe9,0xfe,0xcc,0xe1,0x3d,0xb7,0x16,0xb6,0x14,0xc2,0x28,0xfb,0x2c,0x05,
++        0x2b,0x67,0x9a,0x76,0x2a,0xbe,0x04,0xc3,0xaa,0x44,0x13,0x26,0x49,0x86,0x06,0x99,
++        0x9c,0x42,0x50,0xf4,0x91,0xef,0x98,0x7a,0x33,0x54,0x0b,0x43,0xed,0xcf,0xac,0x62,
++        0xe4,0xb3,0x1c,0xa9,0xc9,0x08,0xe8,0x95,0x80,0xdf,0x94,0xfa,0x75,0x8f,0x3f,0xa6,
++        0x47,0x07,0xa7,0xfc,0xf3,0x73,0x17,0xba,0x83,0x59,0x3c,0x19,0xe6,0x85,0x4f,0xa8,
++        0x68,0x6b,0x81,0xb2,0x71,0x64,0xda,0x8b,0xf8,0xeb,0x0f,0x4b,0x70,0x56,0x9d,0x35,
++        0x1e,0x24,0x0e,0x5e,0x63,0x58,0xd1,0xa2,0x25,0x22,0x7c,0x3b,0x01,0x21,0x78,0x87,
++        0xd4,0x00,0x46,0x57,0x9f,0xd3,0x27,0x52,0x4c,0x36,0x02,0xe7,0xa0,0xc4,0xc8,0x9e,
++        0xea,0xbf,0x8a,0xd2,0x40,0xc7,0x38,0xb5,0xa3,0xf7,0xf2,0xce,0xf9,0x61,0x15,0xa1,
++        0xe0,0xae,0x5d,0xa4,0x9b,0x34,0x1a,0x55,0xad,0x93,0x32,0x30,0xf5,0x8c,0xb1,0xe3,
++        0x1d,0xf6,0xe2,0x2e,0x82,0x66,0xca,0x60,0xc0,0x29,0x23,0xab,0x0d,0x53,0x4e,0x6f,
++        0xd5,0xdb,0x37,0x45,0xde,0xfd,0x8e,0x2f,0x03,0xff,0x6a,0x72,0x6d,0x6c,0x5b,0x51,
++        0x8d,0x1b,0xaf,0x92,0xbb,0xdd,0xbc,0x7f,0x11,0xd9,0x5c,0x41,0x1f,0x10,0x5a,0xd8,
++        0x0a,0xc1,0x31,0x88,0xa5,0xcd,0x7b,0xbd,0x2d,0x74,0xd0,0x12,0xb8,0xe5,0xb4,0xb0,
++        0x89,0x69,0x97,0x4a,0x0c,0x96,0x77,0x7e,0x65,0xb9,0xf1,0x09,0xc5,0x6e,0xc6,0x84,
++        0x18,0xf0,0x7d,0xec,0x3a,0xdc,0x4d,0x20,0x79,0xee,0x5f,0x3e,0xd7,0xcb,0x39,0x48
++    };
++
++    auto rotl32 = [](uint32_t x, uint32_t n) -> uint32_t {
++        return (x << n) | (x >> (32 - n));
++    };
++
++    auto loadBE32 = [](const uint8_t* p) -> uint32_t {
++        return (static_cast<uint32_t>(p[0]) << 24) |
++               (static_cast<uint32_t>(p[1]) << 16) |
++               (static_cast<uint32_t>(p[2]) << 8)  |
++               static_cast<uint32_t>(p[3]);
++    };
++
++    auto storeBE32 = [](uint8_t* p, uint32_t x) {
++        p[0] = static_cast<uint8_t>(x >> 24);
++        p[1] = static_cast<uint8_t>(x >> 16);
++        p[2] = static_cast<uint8_t>(x >> 8);
++        p[3] = static_cast<uint8_t>(x);
++    };
++
++    auto tau = [&](uint32_t x) -> uint32_t {
++        return (static_cast<uint32_t>(SBOX[(x >> 24) & 0xff]) << 24) |
++               (static_cast<uint32_t>(SBOX[(x >> 16) & 0xff]) << 16) |
++               (static_cast<uint32_t>(SBOX[(x >> 8)  & 0xff]) << 8)  |
++               static_cast<uint32_t>(SBOX[x & 0xff]);
++    };
++
++    auto Tp = [&](uint32_t x) -> uint32_t {
++        uint32_t b = tau(x);
++        return b ^ rotl32(b, 13) ^ rotl32(b, 23);
++    };
++
++    uint32_t K[36];
++
++    // 128-bit master key
++    K[0] = loadBE32(inKey + 0)  ^ FK[0];
++    K[1] = loadBE32(inKey + 4)  ^ FK[1];
++    K[2] = loadBE32(inKey + 8)  ^ FK[2];
++    K[3] = loadBE32(inKey + 12) ^ FK[3];
++
++    // 生成 32 个轮密钥，并直接按大端格式写入 128B 输出
++    for (int i = 0; i < 32; ++i) {
++        K[i + 4] = K[i] ^ Tp(K[i + 1] ^ K[i + 2] ^ K[i + 3] ^ CK[i]);
++        storeBE32(outExpanded + i * 4, K[i + 4]);
++    }
++}
++
+ namespace {
+ 
+ constexpr uint32_t kAesCubeBlockDim = 1024;
+@@ -1855,6 +1949,453 @@ DEFINE_AES_CUBE_OP(aes_cube_encrypt_do_recv, AesCubeMode::Recv)
+ 
+ #undef DEFINE_AES_CUBE_OP
+ 
++
++int64_t morus_encrypt_do(
++    at::Tensor &global_key_nounce, 
++    at::Tensor &input,  // input tensor
++    at::Tensor &output, // output tensor
++    bool is_enc,
++    int64_t tp_size = 1
++){
++    char* input_ptr = (char*)input.data_ptr();
++    char* output_ptr = (char*)output.data_ptr();
++    int64_t total_data_size = input.nbytes();
++    int64_t data_size_per_rank = total_data_size / tp_size;
++    int64_t threadnum = 2; // since the plaintext size is usually < 1MB in decode stage of LLM, so 2 is enough
++    int64_t state_batch_size = 640;   //改成640
++    int64_t aligned_size = 8 * state_batch_size * threadnum * sizeof(uint16_t);   //改成 threadnum * 8 * state_batch_size * sizeof(uint16_t)
++    int64_t m_batch_size = (data_size_per_rank + aligned_size - 1) / aligned_size;
++    int64_t data_size_aligned = m_batch_size * aligned_size; // Align the data size to 32 * state_batch_size * threadnum * sizeof(uint16_t)
++    int64_t key_nounce_size = 16 * threadnum * state_batch_size * sizeof(uint16_t);  //改成threadnum * 16 * state_batch_size * sizeof(uint16_t);
++
++    if (!enc_stream) {
++        enc_stream = c10_npu::getCurrentNPUStream().stream();
++    }
++
++    static uint64_t g_call_counter = 0;
++    if (is_enc) {
++        at::Tensor key_nounce = at::rand({16 * threadnum * state_batch_size * sizeof(uint16_t)}, input.options());//改成同308行
++        aclrtMemcpy(global_key_nounce.data_ptr(), 
++                    24 * threadnum * state_batch_size * sizeof(uint16_t), 
++                    key_nounce.data_ptr(), 
++                    24 * threadnum * state_batch_size * sizeof(uint16_t), 
++                    ACL_MEMCPY_DEVICE_TO_DEVICE);
++    }
++    
++    at::Tensor input_aligned = at::rand({data_size_aligned}, input.options());
++    at::Tensor output_aligned = at::rand({data_size_aligned}, input.options());
++    uint16_t* key_nounce_ptr = reinterpret_cast<uint16_t*>(global_key_nounce.data_ptr());
++    uint16_t* input_aligned_ptr = reinterpret_cast<uint16_t*>(input_aligned.data_ptr());
++    uint16_t* output_aligned_ptr = reinterpret_cast<uint16_t*>(output_aligned.data_ptr());
++
++    for (int i = 0; i < tp_size; i++) {
++        aclrtMemcpy((void*)input_aligned_ptr, data_size_per_rank, (void*)(input_ptr + i * data_size_per_rank), data_size_per_rank, ACL_MEMCPY_DEVICE_TO_DEVICE);
++
++        at_npu::native::OpCommand cmd;
++        cmd.Name("morus_encrypt_do");
++        cmd.SetCustomHandler([threadnum, input_aligned_ptr, key_nounce_ptr, output_aligned_ptr, m_batch_size]() -> int {
++            morus_encrypt_do_impl(threadnum, enc_stream, input_aligned_ptr, key_nounce_ptr, output_aligned_ptr, m_batch_size); // call ascen kernel
++            return 0;
++        });
++        cmd.Run();
++
++        aclrtMemcpy((void*)(output_ptr + i * data_size_per_rank), data_size_per_rank, (void*)output_aligned_ptr, data_size_per_rank, ACL_MEMCPY_DEVICE_TO_DEVICE);
++    }
++
++    return 0;
++}
++
++int64_t ascen2_encrypt_do(
++    at::Tensor &key_stream, 
++    at::Tensor &input, 
++    at::Tensor &output,
++    int64_t element_count,
++    int64_t current_pos,
++    bool is_enc,
++    int64_t tp_size = 1
++){
++    char* input_ptr = (char*)input.data_ptr();
++    char* output_ptr = (char*)output.data_ptr();
++    int64_t total_data_size = input.nbytes();
++    int64_t data_size_per_rank = total_data_size / tp_size;
++    int64_t threadnum = 2; // since the plaintext size is usually < 1MB in decode stage of LLM, so 2 is enough
++    int64_t state_batch_size = 384;
++    int64_t aligned_size = 32 * state_batch_size * threadnum * sizeof(uint16_t);
++    int64_t m_batch_size = (data_size_per_rank + aligned_size - 1) / aligned_size;
++    int64_t data_size_aligned = m_batch_size * aligned_size; // Align the data size to 32 * state_batch_size * threadnum * sizeof(uint16_t)
++    int64_t key_nounce_size = 24 * threadnum * state_batch_size * sizeof(uint16_t);
++    uint8_t* base_ptr = reinterpret_cast<uint8_t*>(key_stream.data_ptr());
++
++    if (!enc_stream) {
++        enc_stream = c10_npu::getCurrentNPUStream().stream();
++    }
++
++    if (current_pos + data_size_aligned > element_count) {
++        at::Tensor state = at::rand({key_nounce_size}, key_stream.options());
++        void* state_ptr = state.data_ptr();
++        at_npu::native::OpCommand cmd;
++        cmd.Name("ascen_keystream_do");
++        cmd.SetCustomHandler([threadnum, state_ptr, base_ptr, element_count]() -> int {
++            ascen_keystream_impl(threadnum, enc_stream, state_ptr, base_ptr, element_count);
++            return 0;
++        });
++        cmd.Run();
++        current_pos = 0;
++    }
++    
++    at::Tensor input_aligned = at::empty({data_size_aligned}, input.options());
++    at::Tensor output_aligned = at::empty({data_size_aligned}, input.options());
++    uint16_t* input_aligned_ptr = reinterpret_cast<uint16_t*>(input_aligned.data_ptr());
++    uint16_t* output_aligned_ptr = reinterpret_cast<uint16_t*>(output_aligned.data_ptr());
++
++    void* key_stream_ptr = base_ptr + current_pos;
++    for (int i = 0; i < tp_size; i++) {
++        aclrtMemcpy((void*)input_aligned_ptr, data_size_per_rank, (void*)(input_ptr + i * data_size_per_rank), data_size_per_rank, ACL_MEMCPY_DEVICE_TO_DEVICE);
++
++        at_npu::native::OpCommand cmd;
++        if (is_enc) {
++            cmd.Name("ascen_encrypt_do");
++            cmd.SetCustomHandler([threadnum, input_aligned_ptr, key_stream_ptr, output_aligned_ptr, data_size_aligned]() -> int {
++                ascen_encrypt_impl(threadnum, enc_stream, input_aligned_ptr, key_stream_ptr, output_aligned_ptr, data_size_aligned); // call ascen kernel
++                return 0;
++            });
++            cmd.Run();
++        } else {
++            cmd.Name("ascen_decrypt_do");
++            cmd.SetCustomHandler([threadnum, input_aligned_ptr, key_stream_ptr, output_aligned_ptr, data_size_aligned]() -> int {
++                ascen_decrypt_impl(threadnum, enc_stream, input_aligned_ptr, key_stream_ptr, output_aligned_ptr, data_size_aligned); // call ascen kernel
++                return 0;
++            });
++            cmd.Run();
++        }
++
++        aclrtMemcpy((void*)(output_ptr + i * data_size_per_rank), data_size_per_rank, (void*)output_aligned_ptr, data_size_per_rank, ACL_MEMCPY_DEVICE_TO_DEVICE);
++    }
++
++    if (!is_enc) {
++        current_pos += data_size_aligned;
++    }
++
++    return current_pos;
++}
++void sm4_ctr_encrypt_do_batch(
++    at::Tensor &key_stream,
++    at::Tensor &input,
++    at::Tensor &output,
++    int64_t element_count,
++    bool is_enc,
++    int64_t tp_size = 1
++){
++    if (sm4_current_pos == -1) {
++        sm4_current_pos = element_count;
++    }
++
++    char* input_ptr = reinterpret_cast<char*>(input.data_ptr());
++    char* output_ptr = reinterpret_cast<char*>(output.data_ptr());
++    uint8_t* base_ptr = reinterpret_cast<uint8_t*>(key_stream.data_ptr());
++    int64_t data_size = input.nbytes();
++
++    uint32_t maxValue = 4096;
++
++    const aclrtStream stream = getEncryptionStream();
++
++    if (sm4_current_pos + data_size / tp_size > element_count) {
++        const uint32_t threadnum = SM4_THREAD_NUM;
++
++        uint8_t rk128[SM4_RK_BYTES];
++        expandKeySM4(key, rk128);
++
++        void* deviceRoundKeys = nullptr;
++        aclrtMalloc(&deviceRoundKeys, SM4_RK_BYTES, ACL_MEM_MALLOC_HUGE_FIRST);
++        aclrtMemcpy(deviceRoundKeys, SM4_RK_BYTES, rk128, SM4_RK_BYTES, ACL_MEMCPY_HOST_TO_DEVICE);
++
++        at_npu::native::OpCommand cmd;
++        cmd.Name("sm4_generate_mask_batch");
++        cmd.SetCustomHandler([stream, threadnum, deviceRoundKeys, base_ptr, element_count]() -> int {
++            sm4_ctr_encrypt_do_impl(threadnum, stream, deviceRoundKeys, base_ptr, base_ptr, static_cast<uint32_t>(element_count));
++            return 0;
++        });
++        cmd.Run();
++
++        sm4_current_pos = 0;
++    }
++
++    void* key_stream_ptr = base_ptr + sm4_current_pos;
++
++    if (data_size > 1) {
++        at_npu::native::OpCommand cmd;
++        cmd.Name("xor_do_batch");
++        void* input_ptr_ = reinterpret_cast<void*>(input_ptr);
++        void* output_ptr_ = reinterpret_cast<void*>(output_ptr);
++        cmd.SetCustomHandler([stream, key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
++            xor_do_batch_impl(stream, key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue);
++            return 0;
++        });
++        cmd.Run();
++    }
++
++    if (!is_enc) {
++        sm4_current_pos += data_size / tp_size;
++    }
++
++    return;
++}
++
++
++void sm4_ctr_encrypt_do(
++    at::Tensor &key_stream,
++    at::Tensor &input,
++    at::Tensor &output,
++    int64_t element_count,
++    bool is_enc,
++    int64_t tp_size = 1
++){
++    if (sm4_current_pos == -1) {
++        sm4_current_pos = element_count;
++    }
++
++    char* input_ptr = reinterpret_cast<char*>(input.data_ptr());
++    char* output_ptr = reinterpret_cast<char*>(output.data_ptr());
++    uint8_t* base_ptr = reinterpret_cast<uint8_t*>(key_stream.data_ptr());
++    int64_t data_size = input.nbytes();
++
++    uint32_t maxValue = 4096;
++
++    const aclrtStream stream = getEncryptionStream();
++
++    if (sm4_current_pos + data_size / tp_size > element_count) {
++        const uint32_t threadnum = SM4_THREAD_NUM;
++
++        uint8_t rk128[SM4_RK_BYTES];
++        expandKeySM4(key, rk128);
++
++        void* deviceRoundKeys = nullptr;
++        aclrtMalloc(&deviceRoundKeys, SM4_RK_BYTES, ACL_MEM_MALLOC_HUGE_FIRST);
++        aclrtMemcpy(deviceRoundKeys, SM4_RK_BYTES, rk128, SM4_RK_BYTES, ACL_MEMCPY_HOST_TO_DEVICE);
++
++        at_npu::native::OpCommand cmd;
++        cmd.Name("sm4_generate_mask");
++        cmd.SetCustomHandler([stream, threadnum, deviceRoundKeys, base_ptr, element_count]() -> int {
++            sm4_ctr_encrypt_do_impl(threadnum, stream, deviceRoundKeys, base_ptr, base_ptr, static_cast<uint32_t>(element_count));
++            return 0;
++        });
++        cmd.Run();
++
++        sm4_current_pos = 0;
++    }
++
++    void* key_stream_ptr = base_ptr + sm4_current_pos;
++
++    for (int i = 0; i < tp_size; i++) {
++        at_npu::native::OpCommand cmd;
++        cmd.Name("xor_do");
++        void* input_ptr_ = reinterpret_cast<void*>(input_ptr + i * (data_size / tp_size));
++        void* output_ptr_ = reinterpret_cast<void*>(output_ptr + i * (data_size / tp_size));
++        cmd.SetCustomHandler([stream, key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
++            xor_do_impl(stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
++            return 0;
++        });
++        cmd.Run();
++    }
++
++    if (!is_enc) {
++        sm4_current_pos += data_size / tp_size;
++    }
++
++    return;
++}
++
++
++void sm4_ctr_encrypt_do_unalign(
++    at::Tensor &key_stream,
++    at::Tensor &input,
++    at::Tensor &output,
++    int64_t element_count,
++    bool is_enc,
++    int64_t tp_size = 1
++){
++    if (sm4_current_pos_unalign == -1) {
++        sm4_current_pos_unalign = element_count;
++    }
++
++    char* input_ptr = reinterpret_cast<char*>(input.data_ptr());
++    char* output_ptr = reinterpret_cast<char*>(output.data_ptr());
++    uint8_t* base_ptr = reinterpret_cast<uint8_t*>(key_stream.data_ptr());
++    int64_t data_size = input.nbytes();
++    uint32_t localSizePadding = (data_size / tp_size + 31) / 32 * 32;
++
++    uint32_t maxValue = 4096;
++
++    const aclrtStream stream = getEncryptionStream();
++
++    if (sm4_current_pos_unalign + localSizePadding > element_count) {
++        const uint32_t threadnum = SM4_THREAD_NUM;
++
++        uint8_t rk128[SM4_RK_BYTES];
++        expandKeySM4(key, rk128);
++
++        void* deviceRoundKeys = nullptr;
++        aclrtMalloc(&deviceRoundKeys, SM4_RK_BYTES, ACL_MEM_MALLOC_HUGE_FIRST);
++        aclrtMemcpy(deviceRoundKeys, SM4_RK_BYTES, rk128, SM4_RK_BYTES, ACL_MEMCPY_HOST_TO_DEVICE);
++
++        at_npu::native::OpCommand cmd;
++        cmd.Name("sm4_generate_mask_unalign");
++        cmd.SetCustomHandler([stream, threadnum, deviceRoundKeys, base_ptr, element_count]() -> int {
++            sm4_ctr_encrypt_do_impl(threadnum, stream, deviceRoundKeys, base_ptr, base_ptr, static_cast<uint32_t>(element_count));
++            return 0;
++        });
++        cmd.Run();
++
++        sm4_current_pos_unalign = 0;
++    }
++
++    void* key_stream_ptr = base_ptr + sm4_current_pos_unalign;
++
++    for (int i = 0; i < tp_size; i++) {
++        at_npu::native::OpCommand cmd;
++        cmd.Name("xor_do_unalign");
++        void* input_ptr_ = reinterpret_cast<void*>(input_ptr + i * (data_size / tp_size));
++        void* output_ptr_ = reinterpret_cast<void*>(output_ptr + i * (data_size / tp_size));
++        cmd.SetCustomHandler([stream, key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
++            xor_do_unalign_impl(stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
++            return 0;
++        });
++        cmd.Run();
++    }
++
++    if (!is_enc) {
++        sm4_current_pos_unalign += localSizePadding;
++    }
++
++    return;
++}
++
++
++void sm4_ctr_encrypt_do_send(
++    at::Tensor &key_stream,
++    at::Tensor &input,
++    at::Tensor &output,
++    int64_t element_count,
++    bool is_enc,
++    int64_t tp_size = 1
++){
++    if (sm4_current_pos_send == -1) {
++        sm4_current_pos_send = element_count;
++    }
++
++    char* input_ptr = reinterpret_cast<char*>(input.data_ptr());
++    char* output_ptr = reinterpret_cast<char*>(output.data_ptr());
++    uint8_t* base_ptr = reinterpret_cast<uint8_t*>(key_stream.data_ptr());
++    int64_t data_size = input.nbytes();
++    uint32_t localSizePadding = (data_size / tp_size + 31) / 32 * 32;
++
++    uint32_t maxValue = 4096;
++
++    const aclrtStream stream = getEncryptionStream();
++
++    if (sm4_current_pos_send + localSizePadding > element_count) {
++        const uint32_t threadnum = SM4_THREAD_NUM;
++
++        uint8_t rk128[SM4_RK_BYTES];
++        expandKeySM4(key, rk128);
++
++        void* deviceRoundKeys = nullptr;
++        aclrtMalloc(&deviceRoundKeys, SM4_RK_BYTES, ACL_MEM_MALLOC_HUGE_FIRST);
++        aclrtMemcpy(deviceRoundKeys, SM4_RK_BYTES, rk128, SM4_RK_BYTES, ACL_MEMCPY_HOST_TO_DEVICE);
++
++        at_npu::native::OpCommand cmd;
++        cmd.Name("sm4_generate_mask_send");
++        cmd.SetCustomHandler([stream, threadnum, deviceRoundKeys, base_ptr, element_count]() -> int {
++            sm4_ctr_encrypt_do_impl(threadnum, stream, deviceRoundKeys, base_ptr, base_ptr, static_cast<uint32_t>(element_count));
++            return 0;
++        });
++        cmd.Run();
++
++        sm4_current_pos_send = 0;
++    }
++
++    void* key_stream_ptr = base_ptr + sm4_current_pos_send;
++
++    for (int i = 0; i < tp_size; i++) {
++        at_npu::native::OpCommand cmd;
++        cmd.Name("xor_do_unalign");
++        void* input_ptr_ = reinterpret_cast<void*>(input_ptr + i * (data_size / tp_size));
++        void* output_ptr_ = reinterpret_cast<void*>(output_ptr + i * (data_size / tp_size));
++        cmd.SetCustomHandler([stream, key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
++            xor_do_unalign_impl(stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
++            return 0;
++        });
++        cmd.Run();
++    }
++
++    sm4_current_pos_send += localSizePadding;
++
++    return;
++}
++
++
++void sm4_ctr_encrypt_do_recv(
++    at::Tensor &key_stream,
++    at::Tensor &input,
++    at::Tensor &output,
++    int64_t element_count,
++    bool is_enc,
++    int64_t tp_size = 1
++){
++    if (sm4_current_pos_recv == -1) {
++        sm4_current_pos_recv = element_count;
++    }
++
++    char* input_ptr = reinterpret_cast<char*>(input.data_ptr());
++    char* output_ptr = reinterpret_cast<char*>(output.data_ptr());
++    uint8_t* base_ptr = reinterpret_cast<uint8_t*>(key_stream.data_ptr());
++    int64_t data_size = input.nbytes();
++    uint32_t localSizePadding = (data_size / tp_size + 31) / 32 * 32;
++
++    uint32_t maxValue = 4096;
++
++    const aclrtStream stream = getEncryptionStream();
++
++    if (sm4_current_pos_recv + localSizePadding > element_count) {
++        const uint32_t threadnum = SM4_THREAD_NUM;
++
++        uint8_t rk128[SM4_RK_BYTES];
++        expandKeySM4(key, rk128);
++
++        void* deviceRoundKeys = nullptr;
++        aclrtMalloc(&deviceRoundKeys, SM4_RK_BYTES, ACL_MEM_MALLOC_HUGE_FIRST);
++        aclrtMemcpy(deviceRoundKeys, SM4_RK_BYTES, rk128, SM4_RK_BYTES, ACL_MEMCPY_HOST_TO_DEVICE);
++
++        at_npu::native::OpCommand cmd;
++        cmd.Name("sm4_generate_mask_recv");
++        cmd.SetCustomHandler([stream, threadnum, deviceRoundKeys, base_ptr, element_count]() -> int {
++            sm4_ctr_encrypt_do_impl(threadnum, stream, deviceRoundKeys, base_ptr, base_ptr, static_cast<uint32_t>(element_count));
++            return 0;
++        });
++        cmd.Run();
++
++        sm4_current_pos_recv = 0;
++    }
++
++    void* key_stream_ptr = base_ptr + sm4_current_pos_recv;
++
++    for (int i = 0; i < tp_size; i++) {
++        at_npu::native::OpCommand cmd;
++        cmd.Name("xor_do_unalign");
++        void* input_ptr_ = reinterpret_cast<void*>(input_ptr + i * (data_size / tp_size));
++        void* output_ptr_ = reinterpret_cast<void*>(output_ptr + i * (data_size / tp_size));
++        cmd.SetCustomHandler([stream, key_stream_ptr, input_ptr_, output_ptr_, data_size, tp_size, maxValue]() -> int {
++            xor_do_unalign_impl(stream, key_stream_ptr, input_ptr_, output_ptr_, data_size / tp_size, maxValue);
++            return 0;
++        });
++        cmd.Run();
++    }
++
++    sm4_current_pos_recv += localSizePadding;
++
++    return;
++}
++
+ } // namespace vllm_ascend
+ 
+ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
+@@ -1988,4 +2529,35 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
+     ops.def("aes_cube_encrypt_do_recv(Tensor! keystream, Tensor! input, Tensor! output, int element_count, bool is_enc, int tp_size) -> ()");
+     ops.impl("aes_cube_encrypt_do_recv", torch::kPrivateUse1,
+             &vllm_ascend::aes_cube_encrypt_do_recv);
+-}
+\ No newline at end of file
++
++    ops.def(
++        "morus_encrypt_do(Tensor! global_key_nounce, Tensor! input, Tensor! output, bool is_enc, int tp_size = 1) -> (int ret)");//修改
++    ops.impl("morus_encrypt_do", torch::kPrivateUse1, &vllm_ascend::morus_encrypt_do);
++     
++    ops.def(
++        "ascen2_encrypt_do(Tensor! keystream, Tensor! input, Tensor! output, int element_count, int current_pos, bool is_enc, int tp_size = 1) -> (int ret)");
++    ops.impl("ascen2_encrypt_do", torch::kPrivateUse1, &vllm_ascend::ascen2_encrypt_do);
++
++    ops.def(
++        "sm4_ctr_encrypt_do_batch(Tensor! keystream, Tensor! input, Tensor! output, int element_count, bool is_enc, int tp_size) -> ()");
++    ops.impl("sm4_ctr_encrypt_do_batch", torch::kPrivateUse1, &vllm_ascend::sm4_ctr_encrypt_do_batch);
++
++    ops.def(
++        "sm4_ctr_encrypt_do(Tensor! keystream, Tensor! input, Tensor! output, int element_count, bool is_enc, int tp_size) -> ()");
++    ops.impl("sm4_ctr_encrypt_do", torch::kPrivateUse1, &vllm_ascend::sm4_ctr_encrypt_do);
++
++    ops.def(
++        "sm4_ctr_encrypt_do_unalign(Tensor! keystream, Tensor! input, Tensor! output, int element_count, bool is_enc, int tp_size) -> ()");
++    ops.impl("sm4_ctr_encrypt_do_unalign", torch::kPrivateUse1, &vllm_ascend::sm4_ctr_encrypt_do_unalign);
++
++    ops.def(
++        "sm4_ctr_encrypt_do_send(Tensor! keystream, Tensor! input, Tensor! output, int element_count, bool is_enc, int tp_size) -> ()");
++    ops.impl("sm4_ctr_encrypt_do_send", torch::kPrivateUse1,
++        &vllm_ascend::sm4_ctr_encrypt_do_send);
++
++
++    ops.def(
++        "sm4_ctr_encrypt_do_recv(Tensor! keystream, Tensor! input, Tensor! output, int element_count, bool is_enc, int tp_size) -> ()");
++    ops.impl("sm4_ctr_encrypt_do_recv", torch::kPrivateUse1,
++        &vllm_ascend::sm4_ctr_encrypt_do_recv);
++    }
+\ No newline at end of file
+diff --git a/script/offline_query.py b/script/offline_query.py
+index c6b629f39..89b60f7d6 100644
+--- a/script/offline_query.py
++++ b/script/offline_query.py
+@@ -9,7 +9,7 @@ from vllm import LLM, SamplingParams
+ # os.environ["VLLM_TORCH_PROFILER_DIR"] = "./vllm_profile"
+ # os.environ["VLLM_TORCH_PROFILER_WITH_STACK"] = "0"
+ # os.environ["VLLM_ENC_DYNAMIC_STREAM"] = "1"
+-os.environ["VLLM_ENC_ENABLE"] = "chacha20-naive"
++os.environ["VLLM_ENC_ENABLE"] = "sm4-vec"
+ 
+ # Sample prompts.
+ prompts = [
+@@ -21,7 +21,7 @@ sampling_params = SamplingParams(max_tokens=128, temperature=0.8, top_p=0.95)
+ 
+ def main():
+     # Create an LLM.
+-    llm = LLM(model="/mnt/Qwen3-8B-W8A8",
++    llm = LLM(model="/mnt/model/Qwen3-8B-W8A8",
+               tensor_parallel_size=2,
+               pipeline_parallel_size=1,
+               trust_remote_code=True,
+diff --git a/script/server.sh b/script/server.sh
+index 6ff0adc80..f2208ee86 100644
+--- a/script/server.sh
++++ b/script/server.sh
+@@ -9,13 +9,13 @@ rm -rf /root/.cache/vllm/torch_compile_cache/*
+ # export LD_LIBRARY_PATH=/usr/local/python3.11.13/lib/python3.11/site-packages/torch_npu/lib:$LD_LIBRARY_PATH
+ 
+ # VLLM_ENC_DYNAMIC_STREAM=1 \
+-VLLM_ENC_ENABLE=chacha20-naive \
+-ASCEND_RT_VISIBLE_DEVICES=2,3,4,5 vllm serve /mnt/Qwen3-8B-W8A8 --served-model-name "Qwen3-8B-W8A8" \
++VLLM_ENC_ENABLE=sm4-vec \
++ASCEND_RT_VISIBLE_DEVICES=1,2 vllm serve /mnt/model/Qwen3-8B-W8A8 --served-model-name "Qwen3-8B-W8A8" \
+     --max-model-len 4096 \
+     --quantization ascend \
+     --trust-remote-code \
+     --tensor-parallel-size 2 \
+-    --pipeline-parallel-size 2 \
++    --pipeline-parallel-size 1 \
+     --max-num-seqs 8 \
+     --enforce-eager
+     # --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
+diff --git a/script/test.sh b/script/test.sh
+index 34387d258..30ae62182 100644
+--- a/script/test.sh
++++ b/script/test.sh
+@@ -8,7 +8,7 @@ evalscope perf \
+   --min-tokens 2048 \
+   --api openai \
+   --dataset random \
+-  --tokenizer-path /mnt/Qwen3-8B-W8A8 \
++  --tokenizer-path /mnt/model/Qwen3-8B-W8A8 \
+   --debug \
+   --max-prompt-length 512 \
+   --min-prompt-length 512 \
+diff --git a/vllm_ascend/patch/worker/patch_distributed.py b/vllm_ascend/patch/worker/patch_distributed.py
+index 368926870..530d621e7 100644
+--- a/vllm_ascend/patch/worker/patch_distributed.py
++++ b/vllm_ascend/patch/worker/patch_distributed.py
+@@ -35,11 +35,13 @@ CHACHA20_NAIVE = "chacha20-naive"
+ AES_NAIVE = "aes-naive"
+ AES_VEC = "aes-vec"
+ AES_CUBE = "aes-cube"
++SM4_VEC = "sm4-vec"
+ SUPPORTED_ENCRYPTION_ALGORITHMS = (
+     CHACHA20_NAIVE,
+     AES_NAIVE,
+     AES_VEC,
+     AES_CUBE,
++    SM4_VEC, 
+ )
+ 
+ 
+@@ -210,6 +212,10 @@ class GroupCoordinatorPatch(GroupCoordinator):
+             torch.ops._C_ascend.aes_cube_encrypt_do(
+                 self.key_stream_for_align, input_, output,
+                 self.pool_size_collective, is_encrypt, tp_size)
++        elif self.encryption_algorithm == SM4_VEC:
++            torch.ops._C_ascend.sm4_ctr_encrypt_do(
++                self.key_stream_for_align, input_, output,
++                self.pool_size_collective, is_encrypt, tp_size)
+ 
+     def _crypt_batch(self,
+                      input_: torch.Tensor,
+@@ -236,6 +242,10 @@ class GroupCoordinatorPatch(GroupCoordinator):
+             torch.ops._C_ascend.aes_cube_encrypt_do_batch(
+                 self.key_stream_for_align, input_, output,
+                 self.pool_size_collective, is_encrypt, tp_size)
++        elif self.encryption_algorithm == SM4_VEC:
++            torch.ops._C_ascend.sm4_ctr_encrypt_do_batch(
++                self.key_stream_for_align, input_, output,
++                self.pool_size_collective, is_encrypt, tp_size)
+ 
+     def _crypt_unalign(self,
+                        input_: torch.Tensor,
+@@ -262,6 +272,10 @@ class GroupCoordinatorPatch(GroupCoordinator):
+             torch.ops._C_ascend.aes_cube_encrypt_do_unalign(
+                 self.key_stream_for_unalign, input_, output,
+                 self.pool_size_collective, is_encrypt, tp_size)
++        elif self.encryption_algorithm == SM4_VEC:  
++            torch.ops._C_ascend.sm4_ctr_encrypt_do_unalign(
++                self.key_stream_for_unalign, input_, output,
++                self.pool_size_collective, is_encrypt, tp_size)
+ 
+     def _crypt_send(self,
+                     input_: torch.Tensor,
+@@ -288,7 +302,10 @@ class GroupCoordinatorPatch(GroupCoordinator):
+             torch.ops._C_ascend.aes_cube_encrypt_do_send(
+                 self.key_stream_for_send, input_, output,
+                 self.pool_size_p2p, is_encrypt, tp_size)
+-
++        elif self.encryption_algorithm == SM4_VEC:
++            torch.ops._C_ascend.sm4_ctr_encrypt_do_send(
++                self.key_stream_for_send, input_, output,
++                self.pool_size_p2p, is_encrypt, tp_size)
+     def _crypt_recv(self,
+                     input_: torch.Tensor,
+                     output: torch.Tensor,
+@@ -314,6 +331,10 @@ class GroupCoordinatorPatch(GroupCoordinator):
+             torch.ops._C_ascend.aes_cube_encrypt_do_recv(
+                 self.key_stream_for_recv, input_, output,
+                 self.pool_size_p2p, is_encrypt, tp_size)
++        elif self.encryption_algorithm == SM4_VEC:
++            torch.ops._C_ascend.sm4_ctr_encrypt_do_recv(
++                self.key_stream_for_recv, input_, output,
++                self.pool_size_p2p, is_encrypt, tp_size)
+     
+     def all_to_all(self,
+                    input_: torch.Tensor,

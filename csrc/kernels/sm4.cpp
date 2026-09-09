@@ -9,7 +9,9 @@ constexpr int SM4_RK_PAD_BYTES = 128;                         // 128 本身已 3
 constexpr int VEC_BLOCKS       = 64 * 4;
 constexpr uint32_t MAX_BLOCKS_PER_CALL = VEC_BLOCKS;
 
+// =========================
 // SM4 常量表
+// =========================
 static const uint8_t SM4_SBOX[256] = {
     0xd6,0x90,0xe9,0xfe,0xcc,0xe1,0x3d,0xb7,0x16,0xb6,0x14,0xc2,0x28,0xfb,0x2c,0x05,
     0x2b,0x67,0x9a,0x76,0x2a,0xbe,0x04,0xc3,0xaa,0x44,0x13,0x26,0x49,0x86,0x06,0x99,
@@ -29,7 +31,9 @@ static const uint8_t SM4_SBOX[256] = {
     0x18,0xf0,0x7d,0xec,0x3a,0xdc,0x4d,0x20,0x79,0xee,0x5f,0x3e,0xd7,0xcb,0x39,0x48
 };
 
-
+// =========================
+// Kernel
+// =========================
 class KernelSM4CTR {
 public:
 
@@ -39,31 +43,37 @@ public:
     __aicore__ inline void Init(__gm__ uint8_t* rk128,
                                 __gm__ uint8_t* in,
                                 __gm__ uint8_t* out,
+                                uint32_t nounce1,
+                                uint32_t nounce2,
+                                uint32_t nounce3,
                                 uint32_t dataSize)
     {
         rkGlobal.SetGlobalBuffer((__gm__ uint8_t*)rk128);
+        // 与 AES generate-mask 接口保持一致。CTR keystream 生成阶段不读取 input。
         inGlobal.SetGlobalBuffer((__gm__ uint8_t*)in);
         outGlobal.SetGlobalBuffer((__gm__ uint8_t*)out);
 
+        this->nounce1 = nounce1;
+        this->nounce2 = nounce2;
+        this->nounce3 = nounce3;
         this->dataSize = dataSize;
-        //  这里按完整 block 处理，要求 dataSize 是 16 的整数倍
+
+        // 保持和当前 AES 测试一致：dataSize 要求为 16B 的整数倍。
         this->totalBlocks = dataSize / SM4_BLOCK_SIZE;
 
-        pipe.InitBuffer(rkBytesQ, 1, SM4_RK_PAD_BYTES);                         // 128B
-        pipe.InitBuffer(rkWordsQ, 1, SM4_RK_WORDS * sizeof(uint32_t));          // 32 words
-        pipe.InitBuffer(inQ,      1, MAX_BLOCKS_PER_CALL * SM4_BLOCK_SIZE + 64);
+        pipe.InitBuffer(rkBytesQ, 1, SM4_RK_PAD_BYTES);
+        pipe.InitBuffer(rkWordsQ, 1, SM4_RK_WORDS * sizeof(uint32_t));
         pipe.InitBuffer(outQ,     1, MAX_BLOCKS_PER_CALL * SM4_BLOCK_SIZE + 64);
-        pipe.InitBuffer(scratchQ, 1, VEC_BLOCKS * sizeof(uint32_t) * 4);   // bytes        state
-        pipe.InitBuffer(rkxQ,     1, VEC_BLOCKS * sizeof(uint32_t) * 4);  //rk * 8  rkAll
-        pipe.InitBuffer(btmpQ,    1, VEC_BLOCKS * sizeof(uint32_t) * 4);                //存储中间数据 b0~b3 
+        pipe.InitBuffer(scratchQ, 1, VEC_BLOCKS * sizeof(uint32_t) * 4);
+        pipe.InitBuffer(rkxQ,     1, VEC_BLOCKS * sizeof(uint32_t) * 4);
+        pipe.InitBuffer(btmpQ,    1, VEC_BLOCKS * sizeof(uint32_t) * 4);
         pipe.InitBuffer(SboxBuf, 256 * sizeof(uint32_t));
         pipe.InitBuffer(RotateQ,  1, VEC_BLOCKS * sizeof(uint32_t) * 4);
         pipe.InitBuffer(tLQ,      1, VEC_BLOCKS * sizeof(uint32_t));
 
-
-        LocalTensor<uint32_t>SAll = SboxBuf.Get<uint32_t>();
+        LocalTensor<uint32_t> SAll = SboxBuf.Get<uint32_t>();
         Sbox = SAll;
-        for (int i=0; i < 256 ;++i){
+        for (int i = 0; i < 256; ++i) {
             Sbox(i) = (uint32_t)SM4_SBOX[i];
         }
     }
@@ -87,8 +97,8 @@ public:
         // 每个核内部再按 tile 循环
         for (uint32_t tileStart = coreStart;tileStart < coreEnd; tileStart += blocksToProcess) {
             blocksToProcess = min(MAX_BLOCKS_PER_CALL, coreEnd - tileStart);
-            CopyIn (tileStart, blocksToProcess);
-            Compute(blocksToProcess);
+            CopyIn();
+            Compute(tileStart, blocksToProcess);
             CopyOut(tileStart, blocksToProcess);
         }
     }
@@ -98,7 +108,6 @@ private:
     TPipe pipe;
     TQue<TPosition::VECIN, 1>  rkBytesQ;
     TQue<TPosition::VECIN, 1>  rkWordsQ;
-    TQue<TPosition::VECIN, 1>  inQ;
     TQue<TPosition::VECOUT, 1> outQ;
     TQue<TPosition::VECCALC, 1> scratchQ;
     TQue<TPosition::VECCALC, 1> rkxQ;
@@ -112,6 +121,9 @@ private:
     GlobalTensor<uint8_t> inGlobal;
     GlobalTensor<uint8_t> outGlobal;
 
+    uint32_t nounce1{0};
+    uint32_t nounce2{0};
+    uint32_t nounce3{0};
     uint32_t dataSize{0};
     uint32_t totalBlocks{0};
 
@@ -141,15 +153,15 @@ private:
         return L(Tau(x));
     }
 
-    __aicore__ inline void CopyIn(uint32_t startBlock, uint32_t blocksToProcess)
+    __aicore__ inline void CopyIn()
     {
-        // 1) Copy round keys bytes (128B)
+        // Copy 32 个 SM4 round keys（128B）
         LocalTensor<uint8_t> rkBytesLT = rkBytesQ.AllocTensor<uint8_t>();
         DataCopy(rkBytesLT, rkGlobal, SM4_RK_PAD_BYTES);
 
-        AscendC::PipeBarrier<PIPE_MTE2>();   // 先等 rkBytesLT 搬完
+        AscendC::PipeBarrier<PIPE_MTE2>();
 
-        // Pack to 32 big-endian uint32 words
+        // round key 在 GM 中按大端字节序保存，打包成 32 个 uint32_t
         LocalTensor<uint32_t> rkWordsLT = rkWordsQ.AllocTensor<uint32_t>();
         #pragma unroll
         for (int w = 0; w < SM4_RK_WORDS; ++w) {
@@ -161,71 +173,48 @@ private:
             rkWordsLT(w) = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
         }
 
-        // 3) Copy input blocks
-        LocalTensor<uint8_t> inLocal = inQ.AllocTensor<uint8_t>();
-        uint32_t inputOffset = startBlock * SM4_BLOCK_SIZE;
-        uint32_t inputSize = blocksToProcess * SM4_BLOCK_SIZE;
-        DataCopy(inLocal, inGlobal[inputOffset], inputSize);
-
         rkBytesQ.EnQue(rkBytesLT);
         rkWordsQ.EnQue(rkWordsLT);
-        inQ.EnQue(inLocal);
     }
 
-    __aicore__ inline void Compute(uint32_t blocksToProcess)
+    __aicore__ inline void Compute(uint32_t startBlock, uint32_t blocksToProcess)
     {
         LocalTensor<uint32_t> rkWordsLT = rkWordsQ.DeQue<uint32_t>();
-        LocalTensor<uint8_t>  inLocal   = inQ.DeQue<uint8_t>();
+        LocalTensor<uint8_t>  rkBytesLT = rkBytesQ.DeQue<uint8_t>();
         LocalTensor<uint8_t>  outLocal  = outQ.AllocTensor<uint8_t>();
-        LocalTensor<uint8_t>  rkBytesLT = rkBytesQ.DeQue<uint8_t>(); // 仅为后面释放
 
-        AscendC::PipeBarrier<PIPE_MTE2>();  
-            
         LocalTensor<uint32_t> statelocal = scratchQ.AllocTensor<uint32_t>();
         LocalTensor<uint32_t> state0 = statelocal;
-        LocalTensor<uint32_t> state1 = statelocal[VEC_BLOCKS ];
+        LocalTensor<uint32_t> state1 = statelocal[VEC_BLOCKS];
         LocalTensor<uint32_t> state2 = statelocal[VEC_BLOCKS * 2];
         LocalTensor<uint32_t> state3 = statelocal[VEC_BLOCKS * 3];
-        
-        for (uint32_t b = 0; b < blocksToProcess; b += VEC_BLOCKS) {
-        // uint32_t curBlocks = min((uint32_t)VEC_BLOCKS, blocksToProcess - b);
-            #pragma unroll
-            for (uint32_t lane = 0; lane < VEC_BLOCKS; ++lane) {
-                uint32_t base = (b + lane) << 4;
 
-                uint32_t t0 = (uint32_t)inLocal(base + 0) << 24 |
-                            (uint32_t)inLocal(base + 1) << 16 |
-                            (uint32_t)inLocal(base + 2) << 8  |
-                            (uint32_t)inLocal(base + 3);
+        // CTR 输入块：96-bit nonce || 32-bit counter
+        // 第 i 个全局 block：
+        //   X0 = nounce1
+        //   X1 = nounce2
+        //   X2 = nounce3
+        //   X3 = startBlock + i
+        // SM4 将这四个 uint32_t 视为四个大端 32-bit 字。
+        //
+        // 最后一个 tile 即使不足 VEC_BLOCKS，也初始化全部 lane，
+        // 避免原代码中读取未初始化 LocalTensor 的问题。
+        #pragma unroll
+        for (uint32_t lane = 0; lane < VEC_BLOCKS; ++lane) {
+            state0(lane) = nounce1;
+            state1(lane) = nounce2;
+            state2(lane) = nounce3;
+            state3(lane) = startBlock + lane;
+        }
 
-                uint32_t t1 = (uint32_t)inLocal(base + 4) << 24 |
-                            (uint32_t)inLocal(base + 5) << 16 |
-                            (uint32_t)inLocal(base + 6) << 8  |
-                            (uint32_t)inLocal(base + 7);
-
-                uint32_t t2 = (uint32_t)inLocal(base + 8) << 24 |
-                            (uint32_t)inLocal(base + 9) << 16 |
-                            (uint32_t)inLocal(base + 10) << 8 |
-                            (uint32_t)inLocal(base + 11);
-
-                uint32_t t3 = (uint32_t)inLocal(base + 12) << 24 |
-                            (uint32_t)inLocal(base + 13) << 16 |
-                            (uint32_t)inLocal(base + 14) << 8 |
-                            (uint32_t)inLocal(base + 15);
-
-                    state0(lane) = t0;
-                    state1(lane) = t1;
-                    state2(lane) = t2;
-                    state3(lane) = t3;
-                }
-                SM4_Encrypt_Vector(outLocal, state0, state1, state2, state3, rkWordsLT, b);
-            }
-
-
+        // 生成 CTR keystream：KS_i = SM4_K(nonce || counter_i)
+        // blocksToProcess 只决定 CopyOut 的有效长度；本 Vector 核固定计算 VEC_BLOCKS lanes。
+        SM4_Encrypt_Vector(outLocal,
+                           state0, state1, state2, state3,
+                           rkWordsLT, 0);
 
         outQ.EnQue<uint8_t>(outLocal);
         rkWordsQ.FreeTensor(rkWordsLT);
-        inQ.FreeTensor(inLocal);
         rkBytesQ.FreeTensor(rkBytesLT);
         scratchQ.FreeTensor(statelocal);
     }
@@ -456,7 +445,7 @@ private:
                       (uint32_t(inTensor(10)) << 8)  |  uint32_t(inTensor(11));
         uint32_t x3 = (uint32_t(inTensor(12)) << 24) | (uint32_t(inTensor(13)) << 16) |
                       (uint32_t(inTensor(14)) << 8)  |  uint32_t(inTensor(15));
-
+        // 32 轮，按 4 轮一组写，风格和你 AES 那段保持一致
         #pragma unroll
         for (int r = 0; r < SM4_NR; r += 4) {
             x0 = x0 ^ T(x1 ^ x2 ^ x3 ^ rkWordsLT(r + 0));
@@ -480,27 +469,35 @@ private:
 // =========================
 // Kernel Entry
 // =========================
-extern "C" __global__ __aicore__ void sm4_ctr_encrypt(
-    __gm__ uint8_t* roundKeys128,   // GM: 128B = 32 * uint32 round keys
-    __gm__ uint8_t* input,          // GM: dataSize bytes, must be multiple of 16
-    __gm__ uint8_t* output,         // GM: dataSize bytes
+extern "C" __global__ __aicore__ void sm4_vec_generate_mask(
+    __gm__ uint8_t* roundKeys128,   // GM: 128B = 32 个已展开的 SM4 round keys
+    __gm__ uint8_t* input,          // 为了和 AES 接口一致而保留；本 kernel 不读取 input
+    __gm__ uint8_t* output,         // GM: 输出 SM4-CTR keystream/mask
+    uint32_t nounce1,               // 96-bit nonce 的高 32 bit
+    uint32_t nounce2,               // 96-bit nonce 的中 32 bit
+    uint32_t nounce3,               // 96-bit nonce 的低 32 bit
     uint32_t dataSize)
 {
     KernelSM4CTR op;
-    op.Init(roundKeys128, input, output, dataSize);
+    op.Init(roundKeys128, input, output,
+            nounce1, nounce2, nounce3, dataSize);
     op.Process();
 }
 
-namespace vllm_ascend {
-// Host wrapper: blockDim = number of cores to use
-void sm4_ctr_encrypt_do_impl(uint32_t blockDim, void* stream,
-                        void* roundKeys128, void* input, void* output,
-                        uint32_t dataSize)
+namespace vllm_ascend
 {
-    sm4_ctr_encrypt<<<blockDim, nullptr, stream>>>(
+// Host wrapper: 与 AES generate-mask 风格一致
+void sm4_vec_generate_mask_impl(uint32_t blockDim, void* stream,
+                              void* roundKeys128, void* input, void* output,
+                              uint32_t dataSize)
+{
+    sm4_vec_generate_mask<<<blockDim, nullptr, stream>>>(
         (__gm__ uint8_t*)roundKeys128,
         (__gm__ uint8_t*)input,
         (__gm__ uint8_t*)output,
+        0x12345678,
+        0x11111111,
+        0x22222222,
         dataSize);
 }
 }

@@ -255,7 +255,7 @@ namespace vllm_ascend {
         void* keystream,
         void* ciphertext,
         uint32_t input_size);
-    extern void sm4_ctr_encrypt_do_impl(
+    extern void sm4_vec_generate_mask_impl(
         uint32_t blockDim,
         void* stream,
         void* roundKeys128,

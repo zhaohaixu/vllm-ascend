@@ -2112,7 +2112,7 @@ void sm4_ctr_encrypt_do_batch(
         at_npu::native::OpCommand cmd;
         cmd.Name("sm4_generate_mask_batch");
         cmd.SetCustomHandler([stream, threadnum, deviceRoundKeys, base_ptr, element_count]() -> int {
-            sm4_ctr_encrypt_do_impl(threadnum, stream, deviceRoundKeys, base_ptr, base_ptr, static_cast<uint32_t>(element_count));
+            sm4_vec_generate_mask_impl(threadnum, stream, deviceRoundKeys, base_ptr, base_ptr, static_cast<uint32_t>(element_count));
             return 0;
         });
         cmd.Run();
@@ -2176,7 +2176,7 @@ void sm4_ctr_encrypt_do(
         at_npu::native::OpCommand cmd;
         cmd.Name("sm4_generate_mask");
         cmd.SetCustomHandler([stream, threadnum, deviceRoundKeys, base_ptr, element_count]() -> int {
-            sm4_ctr_encrypt_do_impl(threadnum, stream, deviceRoundKeys, base_ptr, base_ptr, static_cast<uint32_t>(element_count));
+            sm4_vec_generate_mask_impl(threadnum, stream, deviceRoundKeys, base_ptr, base_ptr, static_cast<uint32_t>(element_count));
             return 0;
         });
         cmd.Run();
@@ -2241,7 +2241,7 @@ void sm4_ctr_encrypt_do_unalign(
         at_npu::native::OpCommand cmd;
         cmd.Name("sm4_generate_mask_unalign");
         cmd.SetCustomHandler([stream, threadnum, deviceRoundKeys, base_ptr, element_count]() -> int {
-            sm4_ctr_encrypt_do_impl(threadnum, stream, deviceRoundKeys, base_ptr, base_ptr, static_cast<uint32_t>(element_count));
+            sm4_vec_generate_mask_impl(threadnum, stream, deviceRoundKeys, base_ptr, base_ptr, static_cast<uint32_t>(element_count));
             return 0;
         });
         cmd.Run();
@@ -2306,7 +2306,7 @@ void sm4_ctr_encrypt_do_send(
         at_npu::native::OpCommand cmd;
         cmd.Name("sm4_generate_mask_send");
         cmd.SetCustomHandler([stream, threadnum, deviceRoundKeys, base_ptr, element_count]() -> int {
-            sm4_ctr_encrypt_do_impl(threadnum, stream, deviceRoundKeys, base_ptr, base_ptr, static_cast<uint32_t>(element_count));
+            sm4_vec_generate_mask_impl(threadnum, stream, deviceRoundKeys, base_ptr, base_ptr, static_cast<uint32_t>(element_count));
             return 0;
         });
         cmd.Run();
@@ -2369,7 +2369,7 @@ void sm4_ctr_encrypt_do_recv(
         at_npu::native::OpCommand cmd;
         cmd.Name("sm4_generate_mask_recv");
         cmd.SetCustomHandler([stream, threadnum, deviceRoundKeys, base_ptr, element_count]() -> int {
-            sm4_ctr_encrypt_do_impl(threadnum, stream, deviceRoundKeys, base_ptr, base_ptr, static_cast<uint32_t>(element_count));
+            sm4_vec_generate_mask_impl(threadnum, stream, deviceRoundKeys, base_ptr, base_ptr, static_cast<uint32_t>(element_count));
             return 0;
         });
         cmd.Run();
